@@ -47,6 +47,15 @@ SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 465
 EMAIL_FROM, EMAIL_TO = "you@example.com", ["you@example.com"]
 EMAIL_USER, EMAIL_PASS = "you@example.com", "APP_PASSWORD_HERE"
 
+def sget(row, key):
+    """Safe getter for a pandas Series-like row; returns pd.NA if missing."""
+    try:
+        if isinstance(row, pd.Series) and key in row.index:
+            return row[key]
+    except Exception:
+        pass
+    return pd.NA
+
 def email(subject, html):
     if not USE_EMAIL: return
     msg = MIMEText(html, "html")
@@ -161,12 +170,31 @@ def fetch_history(client, tickers):
 
 # -------------------- SIGNALS --------------------
 def score_row(row, prev):
-    # BUY
-    rsiReclaim30  = pd.notna(prev["rsi"]) and pd.notna(row["rsi"]) and prev["rsi"] < 30 and row["rsi"] >= 30
-    macdBullCross = pd.notna(prev["macd"]) and pd.notna(prev["macds"]) and pd.notna(row["macd"]) and pd.notna(row["macds"]) and prev["macd"] <= prev["macds"] and row["macd"] > row["macds"]
-    emaBullCross  = pd.notna(prev["ema9"]) and pd.notna(prev["ema21"]) and pd.notna(row["ema9"]) and pd.notna(row["ema21"]) and prev["ema9"] <= prev["ema21"] and row["ema9"] > row["ema21"]
-    bbBullBounce  = pd.notna(prev["bbL"]) and pd.notna(row["bbL"]) and prev["close"] < prev["bbL"] and row["close"] > row["bbL"]
-    volExp        = pd.notna(row["volSma20"]) and row["volume"] > row["volSma20"]
+    # Short-circuit if we didn't get proper Series rows
+    if not isinstance(row, pd.Series) or not isinstance(prev, pd.Series):
+        return (0, []), (0, [])
+
+    # Read needed fields safely
+    prsi, rrsi = sget(prev, "rsi"), sget(row, "rsi")
+    pmacd, pcmacd = sget(prev, "macd"), sget(row, "macd")
+    pmacds, pcmacds = sget(prev, "macds"), sget(row, "macds")
+    pema9, rema9 = sget(prev, "ema9"), sget(row, "ema9")
+    pema21, rema21 = sget(prev, "ema21"), sget(row, "ema21")
+    pbbL, rbbL = sget(prev, "bbL"), sget(row, "bbL")
+    pbbU, rbbU = sget(prev, "bbU"), sget(row, "bbU")
+    rvolsma = sget(row, "volSma20")
+    rvol = sget(row, "volume")
+    rclose = sget(row, "close")
+    rsma50 = sget(row, "sma50")
+
+    # BUY side
+    rsiReclaim30  = pd.notna(prsi) and pd.notna(rrsi) and prsi < 30 and rrsi >= 30
+    macdBullCross = (pd.notna(pmacd) and pd.notna(pmacds) and pd.notna(pcmacd) and pd.notna(pcmacds)
+                     and pmacd <= pmacds and pcmacd > pcmacds)
+    emaBullCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
+                     and pema9 <= pema21 and rema9 > rema21)
+    bbBullBounce  = pd.notna(pbbL) and pd.notna(rbbL) and sget(prev, "close") < pbbL and rclose > rbbL
+    volExp        = pd.notna(rvolsma) and pd.notna(rvol) and rvol > rvolsma
 
     buy_score = (W["RSI"] if rsiReclaim30 else 0) + (W["MACD"] if macdBullCross else 0) + \
                 (W["EMA"] if emaBullCross else 0) + (W["BB"] if bbBullBounce else 0) + (W["VOL"] if volExp else 0)
@@ -177,11 +205,13 @@ def score_row(row, prev):
     if bbBullBounce:  buy_reasons.append("BB▲")
     if volExp:        buy_reasons.append("VOL↑")
 
-    # SELL
-    rsiFall70     = pd.notna(prev["rsi"]) and pd.notna(row["rsi"]) and prev["rsi"] > 70 and row["rsi"] <= 70
-    macdBearCross = pd.notna(prev["macd"]) and pd.notna(prev["macds"]) and pd.notna(row["macd"]) and pd.notna(row["macds"]) and prev["macd"] >= prev["macds"] and row["macd"] < row["macds"]
-    emaBearCross  = pd.notna(prev["ema9"]) and pd.notna(prev["ema21"]) and pd.notna(row["ema9"]) and pd.notna(row["ema21"]) and prev["ema9"] >= prev["ema21"] and row["ema9"] < row["ema21"]
-    bbBearReject  = pd.notna(prev["bbU"]) and pd.notna(row["bbU"]) and prev["close"] > prev["bbU"] and row["close"] < row["bbU"]
+    # SELL side
+    rsiFall70     = pd.notna(prsi) and pd.notna(rrsi) and prsi > 70 and rrsi <= 70
+    macdBearCross = (pd.notna(pmacd) and pd.notna(pmacds) and pd.notna(pcmacd) and pd.notna(pcmacds)
+                     and pmacd >= pmacds and pcmacd < pcmacds)
+    emaBearCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
+                     and pema9 >= pema21 and rema9 < rema21)
+    bbBearReject  = pd.notna(pbbU) and pd.notna(rbbU) and sget(prev, "close") > pbbU and rclose < rbbU
 
     sell_score = (W["RSI"] if rsiFall70 else 0) + (W["MACD"] if macdBearCross else 0) + \
                  (W["EMA"] if emaBearCross else 0) + (W["BB"] if bbBearReject else 0) + (W["VOL"] if volExp else 0)
@@ -193,12 +223,13 @@ def score_row(row, prev):
     if volExp:        sell_reasons.append("VOL↑")
 
     # Trend bias
-    trend_up   = pd.notna(row.get("sma50")) and pd.notna(row["close"]) and row["close"] > row["sma50"]
-    trend_down = pd.notna(row.get("sma50")) and pd.notna(row["close"]) and row["close"] < row["sma50"]
+    trend_up   = pd.notna(rsma50) and pd.notna(rclose) and rclose > rsma50
+    trend_down = pd.notna(rsma50) and pd.notna(rclose) and rclose < rsma50
     if not trend_up:   buy_score  = 0
     if not trend_down: sell_score = 0
 
     return (buy_score, buy_reasons), (sell_score, sell_reasons)
+
 
 # -------------------- SCAN --------------------
 def scan_once(tickers):
@@ -222,13 +253,23 @@ def scan_once(tickers):
 
         for sym in data.index.get_level_values(0).unique():
             df = data.xs(sym)
-            if len(df) < 3: continue
-            last, prev = df.iloc[-1], df.iloc[-2]
+            if not isinstance(df, pd.DataFrame) or df.shape[0] < 3:
+                continue
+
+    # some weird returns can still yield Series on iloc; guard it
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
+        # Log and skip this symbol cleanly
+        # print(f"[scan] skip {sym}: unexpected row type")
+                continue
+
             (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)
             if b_score >= BUY_THRESHOLD:
                 all_buys.append((sym, last.name, float(last["close"]), int(b_score), b_reasons))
             if s_score >= SELL_THRESHOLD:
                 all_sells.append((sym, last.name, float(last["close"]), int(s_score), s_reasons))
+
 
         time.sleep(0.25)  # backoff
 

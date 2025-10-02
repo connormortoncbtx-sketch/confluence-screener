@@ -1,0 +1,68 @@
+name: Confluence Screener
+
+on:
+  schedule:
+    # Run every 15 minutes from 13:00–21:59 UTC Mon–Fri.
+    # Covers market hours across DST/Standard with a small buffer.
+    - cron: "*/15 13-21 * * 1-5"
+  workflow_dispatch: {}  # allow manual run
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: confluence-screener
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Quick time gate BEFORE installing anything (saves minutes)
+      - name: Check if US market is open now
+        id: market_open
+        run: |
+          python - << 'PY'
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+          now_ny = datetime.now(ZoneInfo("America/New_York"))
+          # Mon–Fri, between 09:30 and 16:00 local NY time
+          is_weekday = now_ny.weekday() < 5
+          t = now_ny.time()
+          open_now = is_weekday and (time(9,30) <= t <= time(16,0))
+          # We are NOT checking US holidays to avoid installing packages here.
+          # A few holiday runs will exit fast inside the script.
+          with open("${{ github.output }}", "w") as fh:
+              fh.write(f"open={'true' if open_now else 'false'}\n")
+          print("Market open:", open_now, "NY time:", now_ny)
+          PY
+
+      - name: Abort early if market closed
+        if: steps.market_open.outputs.open != 'true'
+        run: echo "Market closed — skipping run."
+
+      - name: Set up Python
+        if: steps.market_open.outputs.open == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.market_open.outputs.open == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create .env from GitHub Secrets
+        if: steps.market_open.outputs.open == 'true'
+        run: |
+          {
+            echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}"
+            echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}"
+            echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}"
+          } > .env
+
+      - name: Run screener
+        if: steps.market_open.outputs.open == 'true'
+        run: python confluence_screener.py

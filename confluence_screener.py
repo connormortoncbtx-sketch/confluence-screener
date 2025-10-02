@@ -15,7 +15,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # -------------------- ENV & PATHS --------------------
 load_dotenv()
@@ -33,8 +33,7 @@ STATE_DIR = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = STATE_DIR / "state.json"  # { "AAPL": {"buy_px": ..., "buy_ts": "..." } }
 
 # -------------------- SCAN CONFIG --------------------
-# Use new SDK style: TimeFrame(n, "Minute") / TimeFrame(1, "Day")
-TIMEFRAME = TimeFrame(5, "Minute")   # 5-minute bars
+TIMEFRAME = TimeFrame(5, TimeFrameUnit.Minute)   # ✅ fixed
 LOOKBACK  = 400
 
 W = dict(RSI=25, MACD=25, EMA=25, BB=15, VOL=10)
@@ -92,7 +91,8 @@ def read_tickers_from_csv(path: Path):
     name_cols = [c for c in df.columns if c.lower() in ["security name","name","description","company name","issuer name"]]
     if name_cols:
         nm = df[name_cols[0]].astype(str).str.lower()
-        mask = ~nm.str.contains(r"\b(etf|trust|fund|warrant|unit|spac)\b", regex=True)
+        # ✅ regex changed to non-capturing
+        mask = ~nm.str.contains(r"\b(?:etf|trust|fund|warrant|unit|spac)\b", regex=True, na=False)
         df = df[mask]
 
     ser = (df[col].astype(str).str.strip()

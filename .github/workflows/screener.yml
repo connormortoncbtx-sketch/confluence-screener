@@ -1,11 +1,10 @@
+# .github/workflows/screener.yml
 name: Confluence Screener
 
 on:
   schedule:
-    # Run every 15 minutes from 13:00–21:59 UTC Mon–Fri.
-    # Covers market hours across DST/Standard with a small buffer.
-    - cron: "*/15 13-21 * * 1-5"
-  workflow_dispatch: {}  # allow manual run
+    - cron: "*/15 13-21 * * 1-5"   # runs every 15m Mon–Fri 13:00–21:59 UTC
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -16,31 +15,29 @@ jobs:
       cancel-in-progress: true
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Quick time gate BEFORE installing anything (saves minutes)
-      - name: Check if US market is open now
+      - name: Check if US market is open now (NY time)
         id: market_open
         run: |
           python - << 'PY'
           from datetime import datetime, time
           from zoneinfo import ZoneInfo
+          import os
           now_ny = datetime.now(ZoneInfo("America/New_York"))
-          # Mon–Fri, between 09:30 and 16:00 local NY time
           is_weekday = now_ny.weekday() < 5
           t = now_ny.time()
           open_now = is_weekday and (time(9,30) <= t <= time(16,0))
-          # We are NOT checking US holidays to avoid installing packages here.
-          # A few holiday runs will exit fast inside the script.
-          with open("${{ github.output }}", "w") as fh:
-              fh.write(f"open={'true' if open_now else 'false'}\n")
           print("Market open:", open_now, "NY time:", now_ny)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"open={'true' if open_now else 'false'}\n")
           PY
 
       - name: Abort early if market closed
         if: steps.market_open.outputs.open != 'true'
         run: echo "Market closed — skipping run."
+
+      - name: Checkout
+        if: steps.market_open.outputs.open == 'true'
+        uses: actions/checkout@v4
 
       - name: Set up Python
         if: steps.market_open.outputs.open == 'true'

@@ -1,5 +1,5 @@
 # Confluence Screener — Discord Alerts (no pandas-ta; indicators via pandas)
-# Features kept:
+# Features:
 # - Confluence alerts (RSI/MACD/EMA/Bollinger/Volume) with 50-SMA trend bias
 # - Discord alerts with reason codes
 # - ETF/SPAC filter (if name/desc column exists)
@@ -19,8 +19,8 @@ from alpaca.data.timeframe import TimeFrame
 
 # -------------------- ENV & PATHS --------------------
 load_dotenv()
-ALPACA_API_KEY     = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY  = os.getenv("ALPACA_SECRET_KEY")
+ALPACA_API_KEY      = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -33,7 +33,8 @@ STATE_DIR = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = STATE_DIR / "state.json"  # { "AAPL": {"buy_px": ..., "buy_ts": "..." } }
 
 # -------------------- SCAN CONFIG --------------------
-TIMEFRAME = TimeFrame.FiveMinutes
+# Use new SDK style: TimeFrame(n, "Minute") / TimeFrame(1, "Day")
+TIMEFRAME = TimeFrame(5, "Minute")   # 5-minute bars
 LOOKBACK  = 400
 
 W = dict(RSI=25, MACD=25, EMA=25, BB=15, VOL=10)
@@ -101,7 +102,7 @@ def read_tickers_from_csv(path: Path):
     print(f"[tickers] loaded {len(tk)} symbols from {path.name}")
     return tk
 
-# -------------------- INDICATORS (manual) --------------------
+# -------------------- INDICATORS (manual, pure pandas) --------------------
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 

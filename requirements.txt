@@ -1,5 +1,5 @@
 alpaca-py
 pandas
-pandas_ta
+pandas-ta
 python-dotenv
 requests

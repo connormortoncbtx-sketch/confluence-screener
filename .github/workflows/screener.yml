@@ -71,7 +71,7 @@ jobs:
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> .env
 
       - name: Run screener
-        if: steps.market_open.outputs.open == 'true'
+        #if: steps.market_open.outputs.open == 'true'
         run: python confluence_screener.py
 
       - name: Save state cache

@@ -182,37 +182,86 @@ def score_row(row, prev):
 
 # ----------------- Scan -----------------
 def scan_once(tickers):
-    all_buys=[]; all_sells=[]
-    for i in range(0,len(tickers),CHUNK):
-        chunk=tickers[i:i+CHUNK]
-        end=datetime.now(ZoneInfo("America/New_York"))
-        start=end-timedelta(minutes=LOOKBACK*5)
-        req=StockBarsRequest(symbol_or_symbols=chunk,timeframe=TIMEFRAME,start=start,end=end,limit=LOOKBACK)
+    """
+    Scans the provided tickers using Alpaca IEX feed (free tier friendly),
+    computes indicators, scores signals, and builds ensemble targets.
+    Returns (all_buys, all_sells).
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from alpaca.data.requests import StockBarsRequest
+
+    all_buys, all_sells = [], []
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    # 5-min bars: LOOKBACK bars ~ LOOKBACK*5 minutes of history
+    end   = datetime.now(ZoneInfo("America/New_York"))
+    start = end - timedelta(minutes=LOOKBACK * 5)
+
+    print(f"[scan] scanning {len(tickers)} tickers, timeframe={TIMEFRAME}, lookback={LOOKBACK}")
+
+    for i in range(0, len(tickers), 120):  # gentle batching
+        chunk = tickers[i:i+120]
+        print(f"[scan] chunk size={len(chunk)}  first={chunk[0]}  last={chunk[-1]}")
+
+        # ---- Fetch bars from IEX feed (avoids SIP subscription error) ----
+        req = StockBarsRequest(
+            symbol_or_symbols=chunk,
+            timeframe=TIMEFRAME,
+            start=start,
+            end=end,
+            limit=LOOKBACK,
+            feed="iex",  # <<<<<< key change
+        )
         try:
-            bars=client.get_stock_bars(req).df
+            bars = client.get_stock_bars(req).df
         except Exception as e:
-            print("[scan] error fetching bars:",e); time.sleep(1); continue
-        if bars is None or bars.empty: continue
-        data=normalize_bars_index(bars)
-        data=compute_indicators(data)
-        if data is None or data.empty: continue
-        idx_names=list(data.index.names)
-        sym_level=0
-        if "symbol" in idx_names: sym_level=idx_names.index("symbol")
-        for sym in data.index.get_level_values(sym_level).unique():
-            df=data.xs(sym,level=sym_level)
-            if not isinstance(df,pd.DataFrame) or df.shape[0]<3: continue
-            last, prev=df.iloc[-1], df.iloc[-2]
-            (b_score,b_reasons),(s_score,s_reasons)=score_row(last,prev)
-            last_px=float(sget(last,"close"))
-            if b_score>=BUY_THRESHOLD:
-                tg=build_targets(df,"BUY",last_px)
-                all_buys.append((sym,last.name,last_px,int(b_score),b_reasons,tg))
-            if s_score>=SELL_THRESHOLD:
-                tg=build_targets(df,"SELL",last_px)
-                all_sells.append((sym,last.name,last_px,int(s_score),s_reasons,tg))
-        time.sleep(0.25)
+            print(f"[scan] error fetching bars: {e}")
+            time.sleep(0.5)
+            continue
+
+        if bars is None or bars.empty:
+            time.sleep(0.1)
+            continue
+
+        # Normalize to MultiIndex ('symbol','timestamp')
+        bars = normalize_bars_index(bars)
+        if bars is None or bars.empty:
+            time.sleep(0.1)
+            continue
+
+        # Compute indicators per symbol
+        data = compute_indicators(bars)
+        if data is None or data.empty:
+            time.sleep(0.1)
+            continue
+
+        # Iterate by symbol (level 0 after normalize)
+        for sym in data.index.get_level_values(0).unique():
+            df = data.xs(sym, level=0)
+            if not isinstance(df, pd.DataFrame) or df.shape[0] < 3:
+                continue
+
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
+                continue
+
+            (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)
+            last_px = float(sget(last, "close"))
+
+            if b_score >= BUY_THRESHOLD:
+                tg = build_targets(df, side="BUY", last_close=last_px)
+                all_buys.append((sym, last.name, last_px, int(b_score), b_reasons, tg))
+
+            if s_score >= SELL_THRESHOLD:
+                tg = build_targets(df, side="SELL", last_close=last_px)
+                all_sells.append((sym, last.name, last_px, int(s_score), s_reasons, tg))
+
+        time.sleep(0.25)  # backoff to be nice to the API
+
     return all_buys, all_sells
+
 
 # ----------------- State -----------------
 STATE_FILE="state/state.json"

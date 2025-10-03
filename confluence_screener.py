@@ -1,4 +1,4 @@
-# Confluence Screener — Discord Alerts (pure pandas indicators, robust to Alpaca index order)
+# Confluence Screener — Discord Alerts (pure pandas indicators, robust index handling)
 # Features:
 # - Confluence alerts (RSI/MACD/EMA/Bollinger/Volume) with 50-SMA trend bias
 # - Discord alerts with reason codes
@@ -6,7 +6,7 @@
 # - Gentler batching + backoff (rate-limit friendly)
 # - Daily digest mode: `python confluence_screener.py --digest`
 # - Persists last BUY; on SELL reports % change since BUY (state/ cache)
-# - Robust to Alpaca MultiIndex order (symbol/timestamp vs timestamp/symbol)
+# - Robust to Alpaca bars index order/shape (MultiIndex or single DatetimeIndex)
 # - Safe guards against odd row shapes
 
 import os, time, ssl, smtplib, csv, requests, sys, json
@@ -137,7 +137,7 @@ def bollinger(close: pd.Series, length=20, mult=2.0):
 
 def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
     out = []
-    # Detect which level is symbol if names are present; otherwise we will handle in scan_once
+    # In this function we assume df_multi is already normalized to MultiIndex by symbol/timestamp.
     for sym in df_multi.index.get_level_values(0).unique():
         sub = df_multi.xs(sym).copy()
         if len(sub) < 50:
@@ -160,6 +160,33 @@ def chunked(lst, n):
 def fetch_history(client, tickers):
     req = StockBarsRequest(symbol_or_symbols=tickers, timeframe=TIMEFRAME, limit=LOOKBACK)
     return client.get_stock_bars(req).df
+
+def normalize_bars_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure bars DataFrame has a MultiIndex ('symbol', 'timestamp'), regardless of how Alpaca returns it.
+    - If already a 2-level index, return as-is (sorted).
+    - If DatetimeIndex (single level) and a 'symbol' column exists, promote it into the index.
+    - If DatetimeIndex and no symbol column, create a placeholder symbol 'UNK' (last resort).
+    """
+    if df is None or df.empty:
+        return df
+    if getattr(df.index, "nlevels", 1) == 2:
+        # try to rename for consistency (if names are present but out of order we fix later)
+        return df.sort_index()
+
+    # Single-level index (likely DatetimeIndex)
+    idx_name = df.index.name or "timestamp"
+    if "symbol" in df.columns:
+        df2 = df.copy()
+        df2 = df2.set_index(["symbol", df2.index], drop=True)
+        df2.index.set_names(["symbol", idx_name], inplace=True)
+        return df2.sort_index()
+    else:
+        df2 = df.copy()
+        df2["symbol"] = "UNK"
+        df2 = df2.set_index(["symbol", df2.index], drop=True)
+        df2.index.set_names(["symbol", idx_name], inplace=True)
+        return df2.sort_index()
 
 # -------------------- SAFE ACCESS HELPERS --------------------
 def sget(row, key):
@@ -250,26 +277,31 @@ def scan_once(tickers):
         if raw is None or raw.empty:
             time.sleep(0.25); continue
 
+        # Normalize to MultiIndex ('symbol', 'timestamp') no matter what we get back
+        raw = normalize_bars_index(raw)
+
         data = compute_indicators(raw)
         if data is None or data.empty:
             time.sleep(0.25); continue
 
-        # ---------- Robust symbol-level detection ----------
-        idx_names = list(data.index.names)
-        if "symbol" in idx_names:
-            sym_level = idx_names.index("symbol")
+        # ---------- Robust symbol-level detection WITHOUT .levels ----------
+        if getattr(data.index, "nlevels", 1) != 2:
+            # Shouldn't happen after normalize, but guard anyway
+            print("[scan] unexpected index shape after normalize; skipping chunk")
+            continue
+
+        # Decide which level is the symbol by dtype: the non-datetime level is the symbol
+        lvl0 = data.index.get_level_values(0)
+        lvl1 = data.index.get_level_values(1)
+        lvl0_is_dt = pd.api.types.is_datetime64_any_dtype(lvl0)
+        lvl1_is_dt = pd.api.types.is_datetime64_any_dtype(lvl1)
+        if lvl0_is_dt and not lvl1_is_dt:
+            sym_level = 1
+        elif lvl1_is_dt and not lvl0_is_dt:
+            sym_level = 0
         else:
-            # Fallback: choose the non-datetime level as symbol
-            levels = data.index.levels
-            # Some SDK versions may have unnamed levels; detect dtype
-            lv0_is_dt = pd.api.types.is_datetime64_any_dtype(levels[0])
-            lv1_is_dt = pd.api.types.is_datetime64_any_dtype(levels[1])
-            if lv0_is_dt and not lv1_is_dt:
-                sym_level = 1
-            elif lv1_is_dt and not lv0_is_dt:
-                sym_level = 0
-            else:
-                sym_level = 0  # last resort
+            # If both look non-datetime (rare), default to level 0 as symbol
+            sym_level = 0
 
         for sym in data.index.get_level_values(sym_level).unique():
             df = data.xs(sym, level=sym_level)

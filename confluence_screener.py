@@ -135,23 +135,6 @@ def bollinger(close: pd.Series, length=20, mult=2.0):
     lower = basis - mult * dev
     return lower, upper
 
-def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
-    out = []
-    # In this function we assume df_multi is already normalized to MultiIndex by symbol/timestamp.
-    for sym in df_multi.index.get_level_values(0).unique():
-        sub = df_multi.xs(sym).copy()
-        if len(sub) < 50:
-            continue
-        sub["rsi"] = rsi_wilder(sub["close"], 14)
-        sub["macd"], sub["macds"] = macd_series(sub["close"], 12, 26, 9)
-        sub["ema9"]  = ema(sub["close"], 9)
-        sub["ema21"] = ema(sub["close"], 21)
-        sub["bbL"], sub["bbU"] = bollinger(sub["close"], 20, 2.0)
-        sub["volSma20"] = sma(sub["volume"], 20)
-        sub["sma50"] = sma(sub["close"], 50)
-        out.append(sub)
-    return pd.concat(out).sort_index() if out else pd.DataFrame()
-
 # -------------------- DATA --------------------
 def chunked(lst, n):
     for i in range(0, len(lst), n):
@@ -212,6 +195,40 @@ def sget(row, key):
     except Exception:
         pass
     return pd.NA
+
+# -------------------- INDICATOR COMPUTATION (returns MultiIndex) --------------------
+def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assumes df_multi has MultiIndex ('symbol','timestamp') from normalize_bars_index.
+    Returns a concatenated DataFrame with the SAME MultiIndex.
+    """
+    if df_multi is None or df_multi.empty:
+        return pd.DataFrame()
+
+    # Identify symbol level by name if present, else default to 0
+    sym_level = 'symbol' if 'symbol' in (df_multi.index.names or []) else 0
+
+    per_symbol = {}
+    symbols = df_multi.index.get_level_values(sym_level).unique()
+    for sym in symbols:
+        sub = df_multi.xs(sym, level=sym_level).copy()
+        if len(sub) < 50:
+            continue
+        sub["rsi"] = rsi_wilder(sub["close"], 14)
+        sub["macd"], sub["macds"] = macd_series(sub["close"], 12, 26, 9)
+        sub["ema9"]  = ema(sub["close"], 9)
+        sub["ema21"] = ema(sub["close"], 21)
+        sub["bbL"], sub["bbU"] = bollinger(sub["close"], 20, 2.0)
+        sub["volSma20"] = sma(sub["volume"], 20)
+        sub["sma50"] = sma(sub["close"], 50)
+        per_symbol[sym] = sub
+
+    if not per_symbol:
+        return pd.DataFrame()
+
+    # Concatenate with keys to force MultiIndex ('symbol','timestamp')
+    out = pd.concat(per_symbol, names=["symbol", "timestamp"]).sort_index()
+    return out
 
 # -------------------- SIGNALS --------------------
 def score_row(row, prev):
@@ -299,20 +316,9 @@ def scan_once(tickers):
         if data is None or data.empty:
             time.sleep(0.25); continue
 
-        # Decide which level is the symbol by dtype: the non-datetime level is the symbol
-        lvl0 = data.index.get_level_values(0)
-        lvl1 = data.index.get_level_values(1)
-        lvl0_is_dt = pd.api.types.is_datetime64_any_dtype(lvl0)
-        lvl1_is_dt = pd.api.types.is_datetime64_any_dtype(lvl1)
-        if lvl0_is_dt and not lvl1_is_dt:
-            sym_level = 1
-        elif lvl1_is_dt and not lvl0_is_dt:
-            sym_level = 0
-        else:
-            sym_level = 0  # default
-
-        for sym in data.index.get_level_values(sym_level).unique():
-            df = data.xs(sym, level=sym_level)
+        # We now KNOW data is MultiIndex ('symbol','timestamp'); iterate by symbol (level 0)
+        for sym in data.index.get_level_values(0).unique():
+            df = data.xs(sym, level=0)
             if not isinstance(df, pd.DataFrame) or df.shape[0] < 3:
                 continue
 
@@ -320,7 +326,6 @@ def scan_once(tickers):
             last = df.iloc[-1]
             prev = df.iloc[-2]
             if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
-                # print(f"[scan] skip {sym}: unexpected row type")
                 continue
 
             (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)

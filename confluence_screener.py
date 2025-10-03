@@ -74,19 +74,40 @@ def compute_macd(series, fast=12, slow=26, signal=9):
     return macd, signal_line
 
 def compute_indicators(df):
-    if df is None or df.empty: return df
+    if df is None or df.empty:
+        return df
+
+    # RSI
     df["rsi"] = df.groupby(level=0)["close"].transform(compute_rsi)
-    macd, sig = df.groupby(level=0)["close"].transform(compute_macd)
-    df["macd"] = macd
-    df["macd_signal"] = sig
+
+    # MACD and signal separately
+    def _macd(series):
+        exp1 = series.ewm(span=12, adjust=False).mean()
+        exp2 = series.ewm(span=26, adjust=False).mean()
+        return exp1 - exp2
+
+    def _macd_signal(series):
+        macd = _macd(series)
+        return macd.ewm(span=9, adjust=False).mean()
+
+    df["macd"] = df.groupby(level=0)["close"].transform(_macd)
+    df["macd_signal"] = df.groupby(level=0)["close"].transform(_macd_signal)
+
+    # EMAs
     df["ema9"] = df.groupby(level=0)["close"].transform(lambda x: x.ewm(span=9, adjust=False).mean())
     df["ema21"] = df.groupby(level=0)["close"].transform(lambda x: x.ewm(span=21, adjust=False).mean())
-    df["vol_ma20"] = df.groupby(level=0)["volume"].transform(lambda x: x.rolling(20,min_periods=20).mean())
-    df["bb_mid"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20,min_periods=20).mean())
-    df["bb_std"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20,min_periods=20).std())
+
+    # Volume MA
+    df["vol_ma20"] = df.groupby(level=0)["volume"].transform(lambda x: x.rolling(20, min_periods=20).mean())
+
+    # Bollinger Bands
+    df["bb_mid"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20, min_periods=20).mean())
+    df["bb_std"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20, min_periods=20).std())
     df["bb_upper"] = df["bb_mid"] + 2*df["bb_std"]
     df["bb_lower"] = df["bb_mid"] - 2*df["bb_std"]
+
     return df
+
 
 # ----------------- Target Builders -----------------
 def true_range(df: pd.DataFrame) -> pd.Series:

@@ -163,30 +163,45 @@ def fetch_history(client, tickers):
 
 def normalize_bars_index(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure bars DataFrame has a MultiIndex ('symbol', 'timestamp'), regardless of how Alpaca returns it.
-    - If already a 2-level index, return as-is (sorted).
-    - If DatetimeIndex (single level) and a 'symbol' column exists, promote it into the index.
-    - If DatetimeIndex and no symbol column, create a placeholder symbol 'UNK' (last resort).
+    Normalize Alpaca bars DataFrame to a MultiIndex ('symbol','timestamp') with symbol first.
+    Handles:
+      - Already MultiIndex in any order
+      - Single DatetimeIndex + 'symbol' column
+      - Single DatetimeIndex without symbol column (fallback 'UNK')
     """
     if df is None or df.empty:
         return df
+
+    # Case A: Already MultiIndex
     if getattr(df.index, "nlevels", 1) == 2:
-        # try to rename for consistency (if names are present but out of order we fix later)
+        lvl0 = df.index.get_level_values(0)
+        lvl1 = df.index.get_level_values(1)
+        lvl0_is_dt = pd.api.types.is_datetime64_any_dtype(lvl0)
+        lvl1_is_dt = pd.api.types.is_datetime64_any_dtype(lvl1)
+
+        # We want ('symbol','timestamp') — i.e., non-datetime first, datetime second
+        if lvl0_is_dt and not lvl1_is_dt:
+            df = df.swaplevel(0, 1)
+
+        # Force consistent names and sort
+        df.index = df.index.set_names(["symbol", "timestamp"])
         return df.sort_index()
 
-    # Single-level index (likely DatetimeIndex)
-    idx_name = df.index.name or "timestamp"
+    # Case B: Single-level index (likely DatetimeIndex)
+    # Ensure the index has a proper name to become 'timestamp'
+    if not df.index.name:
+        df.index.name = "timestamp"
+
+    # If there is a symbol column, promote to MultiIndex
     if "symbol" in df.columns:
-        df2 = df.copy()
-        df2 = df2.set_index(["symbol", df2.index], drop=True)
-        df2.index.set_names(["symbol", idx_name], inplace=True)
-        return df2.sort_index()
-    else:
-        df2 = df.copy()
-        df2["symbol"] = "UNK"
-        df2 = df2.set_index(["symbol", df2.index], drop=True)
-        df2.index.set_names(["symbol", idx_name], inplace=True)
-        return df2.sort_index()
+        df2 = df.reset_index().set_index(["symbol", "timestamp"]).sort_index()
+        return df2
+
+    # Fallback: synthesize a symbol when missing
+    df2 = df.copy()
+    df2["symbol"] = "UNK"
+    df2 = df2.reset_index().set_index(["symbol", "timestamp"]).sort_index()
+    return df2
 
 # -------------------- SAFE ACCESS HELPERS --------------------
 def sget(row, key):
@@ -284,12 +299,6 @@ def scan_once(tickers):
         if data is None or data.empty:
             time.sleep(0.25); continue
 
-        # ---------- Robust symbol-level detection WITHOUT .levels ----------
-        if getattr(data.index, "nlevels", 1) != 2:
-            # Shouldn't happen after normalize, but guard anyway
-            print("[scan] unexpected index shape after normalize; skipping chunk")
-            continue
-
         # Decide which level is the symbol by dtype: the non-datetime level is the symbol
         lvl0 = data.index.get_level_values(0)
         lvl1 = data.index.get_level_values(1)
@@ -300,8 +309,7 @@ def scan_once(tickers):
         elif lvl1_is_dt and not lvl0_is_dt:
             sym_level = 0
         else:
-            # If both look non-datetime (rare), default to level 0 as symbol
-            sym_level = 0
+            sym_level = 0  # default
 
         for sym in data.index.get_level_values(sym_level).unique():
             df = data.xs(sym, level=sym_level)

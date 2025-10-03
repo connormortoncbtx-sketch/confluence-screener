@@ -1,442 +1,282 @@
-# Confluence Screener — Discord Alerts (pure pandas indicators, robust index handling)
-# Features:
-# - Confluence alerts (RSI/MACD/EMA/Bollinger/Volume) with 50-SMA trend bias
-# - Discord alerts with reason codes
-# - ETF/SPAC filter (if name/desc column exists)
-# - Gentler batching + backoff (rate-limit friendly)
-# - Daily digest mode: `python confluence_screener.py --digest`
-# - Persists last BUY; on SELL reports % change since BUY (state/ cache)
-# - Robust to Alpaca bars index order/shape (MultiIndex or single DatetimeIndex)
-# - Safe guards against odd row shapes
-
-import os, time, ssl, smtplib, csv, requests, sys, json
-from email.mime.text import MIMEText
-from collections import defaultdict
-from pathlib import Path
+import os, time, json, math, sys
 import pandas as pd
-from dotenv import load_dotenv
+import numpy as np
+import requests
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
-# -------------------- ENV & PATHS --------------------
-load_dotenv()
-ALPACA_API_KEY      = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
+# ----------------- Config -----------------
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-    raise SystemExit("Missing ALPACA_API_KEY/ALPACA_SECRET_KEY (set in .env or GitHub Secrets)")
-if not DISCORD_WEBHOOK_URL:
-    print("Warning: DISCORD_WEBHOOK_URL not set — discord alerts disabled.")
-
-CSV_PATH  = Path("nasdaqlisted.csv")   # must be in repo root
-STATE_DIR = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
-STATE_PATH = STATE_DIR / "state.json"  # { "AAPL": {"buy_px": ..., "buy_ts": "..." } }
-
-# -------------------- SCAN CONFIG --------------------
-TIMEFRAME = TimeFrame(5, TimeFrameUnit.Minute)   # 5-minute bars
-LOOKBACK  = 400
-
-W = dict(RSI=25, MACD=25, EMA=25, BB=15, VOL=10)
-BUY_THRESHOLD  = 60
+TIMEFRAME = TimeFrame(5, TimeFrameUnit.Minute)
+LOOKBACK = 400
+CHUNK = 120
+BUY_THRESHOLD = 60
 SELL_THRESHOLD = 60
-COOLDOWN_SEC   = 30 * 60  # per ticker per direction (in-process)
 
-# -------------------- OPTIONAL EMAIL (OFF) --------------------
-USE_EMAIL = False
-SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 465
-EMAIL_FROM, EMAIL_TO = "you@example.com", ["you@example.com"]
-EMAIL_USER, EMAIL_PASS = "you@example.com", "APP_PASSWORD_HERE"
+# ----------------- Alpaca -----------------
+client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-def email(subject, html):
-    if not USE_EMAIL: return
-    msg = MIMEText(html, "html")
-    msg["Subject"] = subject; msg["From"] = EMAIL_FROM; msg["To"] = ", ".join(EMAIL_TO)
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
-        s.login(EMAIL_USER, EMAIL_PASS)
-        s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-
-def discord(msg: str):
-    if not DISCORD_WEBHOOK_URL: return
+# ----------------- Helpers -----------------
+def sget(row, col, default=np.nan):
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
-    except Exception as e:
-        print(f"[discord] post failed: {e}")
-
-# -------------------- STATE --------------------
-def load_state() -> dict:
-    if STATE_PATH.exists():
-        try: return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception as e: print(f"[state] read error: {e}")
-    return {}
-
-def save_state(state: dict):
-    try: STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception as e: print(f"[state] write error: {e}")
-
-# -------------------- TICKERS --------------------
-def read_tickers_from_csv(path: Path):
-    if not path.exists():
-        raise SystemExit(f"Ticker file not found: {path}")
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        sample = f.read(4096)
-        delim = csv.Sniffer().sniff(sample, delimiters="|,\t;").delimiter
-    df = pd.read_csv(path, delimiter=delim)
-
-    # symbol column
-    cands = [c for c in df.columns if c.lower() in ["symbol","ticker","symbols","tickers"]]
-    col = cands[0] if cands else df.columns[0]
-
-    # optional ETF/SPAC/etc filter by name/desc
-    name_cols = [c for c in df.columns if c.lower() in ["security name","name","description","company name","issuer name"]]
-    if name_cols:
-        nm = df[name_cols[0]].astype(str).str.lower()
-        # non-capturing group + na=False to avoid warnings/NaNs
-        mask = ~nm.str.contains(r"\b(?:etf|trust|fund|warrant|unit|spac)\b", regex=True, na=False)
-        df = df[mask]
-
-    ser = (df[col].astype(str).str.strip()
-           .str.replace(r"[^\w\.-]", "", regex=True)
-           .replace("", pd.NA).dropna().drop_duplicates())
-    tk = ser.tolist()
-    print(f"[tickers] loaded {len(tk)} symbols from {path.name}")
-    return tk
-
-# -------------------- INDICATORS (manual, pure pandas) --------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def sma(series: pd.Series, length: int) -> pd.Series:
-    return series.rolling(length, min_periods=length).mean()
-
-def rsi_wilder(close: pd.Series, length: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def macd_series(close: pd.Series, fast=12, slow=26, signal=9):
-    fast_ema = ema(close, fast)
-    slow_ema = ema(close, slow)
-    macd = fast_ema - slow_ema
-    macds = ema(macd, signal)
-    return macd, macds
-
-def bollinger(close: pd.Series, length=20, mult=2.0):
-    basis = sma(close, length)
-    dev = close.rolling(length, min_periods=length).std()
-    upper = basis + mult * dev
-    lower = basis - mult * dev
-    return lower, upper
-
-# -------------------- DATA --------------------
-def chunked(lst, n):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-def fetch_history(client, tickers):
-    req = StockBarsRequest(symbol_or_symbols=tickers, timeframe=TIMEFRAME, limit=LOOKBACK)
-    return client.get_stock_bars(req).df
+        return row[col]
+    except Exception:
+        return default
 
 def normalize_bars_index(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize Alpaca bars DataFrame to a MultiIndex ('symbol','timestamp') with symbol first.
-    Handles:
-      - Already MultiIndex in any order
-      - Single DatetimeIndex + 'symbol' column
-      - Single DatetimeIndex without symbol column (fallback 'UNK')
+    Handles MultiIndex in any order, single DatetimeIndex + symbol col, or single index.
     """
     if df is None or df.empty:
         return df
-
-    # Case A: Already MultiIndex
     if getattr(df.index, "nlevels", 1) == 2:
         lvl0 = df.index.get_level_values(0)
         lvl1 = df.index.get_level_values(1)
         lvl0_is_dt = pd.api.types.is_datetime64_any_dtype(lvl0)
         lvl1_is_dt = pd.api.types.is_datetime64_any_dtype(lvl1)
-
-        # We want ('symbol','timestamp') — i.e., non-datetime first, datetime second
         if lvl0_is_dt and not lvl1_is_dt:
-            df = df.swaplevel(0, 1)
-
-        # Force consistent names and sort
-        df.index = df.index.set_names(["symbol", "timestamp"])
+            df = df.swaplevel(0,1)
+        df.index = df.index.set_names(["symbol","timestamp"])
         return df.sort_index()
-
-    # Case B: Single-level index (likely DatetimeIndex)
-    # Ensure the index has a proper name to become 'timestamp'
     if not df.index.name:
         df.index.name = "timestamp"
-
-    # If there is a symbol column, promote to MultiIndex
     if "symbol" in df.columns:
-        df2 = df.reset_index().set_index(["symbol", "timestamp"]).sort_index()
+        df2 = df.reset_index().set_index(["symbol","timestamp"]).sort_index()
         return df2
-
-    # Fallback: synthesize a symbol when missing
     df2 = df.copy()
     df2["symbol"] = "UNK"
-    df2 = df2.reset_index().set_index(["symbol", "timestamp"]).sort_index()
+    df2 = df2.reset_index().set_index(["symbol","timestamp"]).sort_index()
     return df2
 
-# -------------------- SAFE ACCESS HELPERS --------------------
-def sget(row, key):
-    """Safe getter for a pandas Series-like row; returns pd.NA if missing or wrong type."""
-    try:
-        if isinstance(row, pd.Series) and key in row.index:
-            return row[key]
-    except Exception:
-        pass
-    return pd.NA
+# ----------------- Indicators -----------------
+def compute_rsi(series, length=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1*delta.clip(upper=0)
+    ma_up = up.rolling(length, min_periods=length).mean()
+    ma_down = down.rolling(length, min_periods=length).mean()
+    rs = ma_up/ma_down
+    rsi = 100 - (100/(1+rs))
+    return rsi
 
-# -------------------- INDICATOR COMPUTATION (returns MultiIndex) --------------------
-def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
-    """
-    Assumes df_multi has MultiIndex ('symbol','timestamp') from normalize_bars_index.
-    Returns a concatenated DataFrame with the SAME MultiIndex.
-    """
-    if df_multi is None or df_multi.empty:
-        return pd.DataFrame()
+def compute_macd(series, fast=12, slow=26, signal=9):
+    exp1 = series.ewm(span=fast, adjust=False).mean()
+    exp2 = series.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd, signal_line
 
-    # Identify symbol level by name if present, else default to 0
-    sym_level = 'symbol' if 'symbol' in (df_multi.index.names or []) else 0
+def compute_indicators(df):
+    if df is None or df.empty: return df
+    df["rsi"] = df.groupby(level=0)["close"].transform(compute_rsi)
+    macd, sig = df.groupby(level=0)["close"].transform(compute_macd)
+    df["macd"] = macd
+    df["macd_signal"] = sig
+    df["ema9"] = df.groupby(level=0)["close"].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+    df["ema21"] = df.groupby(level=0)["close"].transform(lambda x: x.ewm(span=21, adjust=False).mean())
+    df["vol_ma20"] = df.groupby(level=0)["volume"].transform(lambda x: x.rolling(20,min_periods=20).mean())
+    df["bb_mid"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20,min_periods=20).mean())
+    df["bb_std"] = df.groupby(level=0)["close"].transform(lambda x: x.rolling(20,min_periods=20).std())
+    df["bb_upper"] = df["bb_mid"] + 2*df["bb_std"]
+    df["bb_lower"] = df["bb_mid"] - 2*df["bb_std"]
+    return df
 
-    per_symbol = {}
-    symbols = df_multi.index.get_level_values(sym_level).unique()
-    for sym in symbols:
-        sub = df_multi.xs(sym, level=sym_level).copy()
-        if len(sub) < 50:
-            continue
-        sub["rsi"] = rsi_wilder(sub["close"], 14)
-        sub["macd"], sub["macds"] = macd_series(sub["close"], 12, 26, 9)
-        sub["ema9"]  = ema(sub["close"], 9)
-        sub["ema21"] = ema(sub["close"], 21)
-        sub["bbL"], sub["bbU"] = bollinger(sub["close"], 20, 2.0)
-        sub["volSma20"] = sma(sub["volume"], 20)
-        sub["sma50"] = sma(sub["close"], 50)
-        per_symbol[sym] = sub
+# ----------------- Target Builders -----------------
+def true_range(df: pd.DataFrame) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    if not per_symbol:
-        return pd.DataFrame()
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    return true_range(df).rolling(length, min_periods=length).mean()
 
-    # Concatenate with keys to force MultiIndex ('symbol','timestamp')
-    out = pd.concat(per_symbol, names=["symbol", "timestamp"]).sort_index()
-    return out
+def prior_day_hlc(df: pd.DataFrame):
+    ts = df.index.get_level_values("timestamp")
+    dates = pd.to_datetime(ts).date
+    last_day = pd.Series(dates).iloc[-1]
+    prev_mask = dates < last_day
+    if not prev_mask.any(): return None
+    prev = df[prev_mask]
+    prev_date = pd.to_datetime(prev.index.get_level_values("timestamp")).date[-1]
+    day_df = prev[pd.to_datetime(prev.index.get_level_values("timestamp")).date == prev_date]
+    if day_df.empty: return None
+    return float(day_df["high"].max()), float(day_df["low"].min()), float(day_df["close"].iloc[-1])
 
-# -------------------- SIGNALS --------------------
+def classic_pivots(h,l,c):
+    P=(h+l+c)/3.0
+    R1=2*P-l; S1=2*P-h; R2=P+(h-l); S2=P-(h-l)
+    return {"P":P,"R1":R1,"R2":R2,"S1":S1,"S2":S2}
+
+def recent_swing(prices: pd.Series, lookback: int = 80):
+    tail=prices.tail(lookback)
+    return float(tail.min()), float(tail.max())
+
+def fib_levels_from_swing(low: float, high: float):
+    diff = high-low
+    return {
+        "23.6%": high-0.236*diff,
+        "38.2%": high-0.382*diff,
+        "50%": high-0.5*diff,
+        "61.8%": high-0.618*diff,
+        "78.6%": high-0.786*diff,
+        "127.2%": high+0.272*diff,
+        "161.8%": high+0.618*diff,
+    }
+
+def donchian_levels(df: pd.DataFrame, length: int=20):
+    return float(df["high"].rolling(length,min_periods=length).max().iloc[-1]), float(df["low"].rolling(length,min_periods=length).min().iloc[-1])
+
+def median_ignore_nans(vals):
+    vals=[v for v in vals if v is not None and pd.notna(v)]
+    if not vals: return None
+    return float(pd.Series(vals).median())
+
+def build_targets(df_symbol: pd.DataFrame, side: str, last_close: float):
+    if df_symbol is None or df_symbol.shape[0] < 30 or pd.isna(last_close): return {}
+    a = float(atr(df_symbol,14).iloc[-1]) if df_symbol.shape[0]>=14 else None
+    d_hi,d_lo = donchian_levels(df_symbol,20)
+    pr = prior_day_hlc(df_symbol)
+    piv = classic_pivots(*pr) if pr else None
+    sw_lo, sw_hi = recent_swing(df_symbol["close"],80)
+    fibs = fib_levels_from_swing(sw_lo,sw_hi) if sw_hi>sw_lo else None
+    if side=="BUY":
+        stop=min([fibs.get("23.6%") if fibs else None,d_lo,piv.get("S1") if piv else None,last_close-(1.0*a) if a else None],default=None)
+        t1=median_ignore_nans([fibs.get("38.2%") if fibs else None,d_hi,piv.get("R1") if piv else None,last_close+(1.0*a) if a else None])
+        t2=median_ignore_nans([fibs.get("61.8%") if fibs else None,piv.get("R2") if piv else None,last_close+(1.5*a) if a else None,fibs.get("127.2%") if fibs else None])
+    else:
+        stop=max([fibs.get("23.6%") if fibs else None,d_hi,piv.get("R1") if piv else None,last_close+(1.0*a) if a else None],default=None)
+        t1=median_ignore_nans([fibs.get("61.8%") if fibs else None,d_lo,piv.get("S1") if piv else None,last_close-(1.0*a) if a else None])
+        t2=median_ignore_nans([fibs.get("78.6%") if fibs else None,piv.get("S2") if piv else None,last_close-(1.5*a) if a else None,fibs.get("161.8%") if fibs else None])
+    return {"stop":stop,"t1":t1,"t2":t2}
+
+# ----------------- Scoring -----------------
 def score_row(row, prev):
-    # Short-circuit if we didn't get proper Series rows
-    if not isinstance(row, pd.Series) or not isinstance(prev, pd.Series):
-        return (0, []), (0, [])
+    score=0; reasons=[]
+    if pd.notna(prev["rsi"]) and pd.notna(row["rsi"]):
+        if prev["rsi"]<30 and row["rsi"]>=30: score+=25; reasons.append("RSI↑30")
+        if prev["rsi"]>70 and row["rsi"]<=70: score+=25; reasons.append("RSI↓70")
+    if pd.notna(row["macd"]) and pd.notna(row["macd_signal"]):
+        if row["macd"]>row["macd_signal"]: score+=20; reasons.append("MACD×")
+        else: score+=20; reasons.append("MACD×")
+    if pd.notna(row["ema9"]) and pd.notna(row["ema21"]):
+        if row["ema9"]>row["ema21"]: score+=15; reasons.append("EMA9>21")
+        else: score+=15; reasons.append("EMA9<21")
+    if pd.notna(prev["vol_ma20"]) and pd.notna(row["volume"]):
+        if row["volume"]>1.5*row["vol_ma20"]: score+=10; reasons.append("VOL↑")
+    if pd.notna(row["close"]) and pd.notna(row["bb_upper"]) and pd.notna(row["bb_lower"]):
+        if row["close"]>row["bb_upper"]: score+=10; reasons.append("BB▲")
+        if row["close"]<row["bb_lower"]: score+=10; reasons.append("BB▼")
+    buy_score=score if "RSI↑30" in reasons or "EMA9>21" in reasons or "MACD×" in reasons else 0
+    sell_score=score if "RSI↓70" in reasons or "EMA9<21" in reasons or "MACD×" in reasons else 0
+    return (buy_score,reasons),(sell_score,reasons)
 
-    # Safely read all fields
-    prsi, rrsi = sget(prev, "rsi"), sget(row, "rsi")
-    pmacd, pcmacd = sget(prev, "macd"), sget(row, "macd")
-    pmacds, pcmacds = sget(prev, "macds"), sget(row, "macds")
-    pema9, rema9 = sget(prev, "ema9"), sget(row, "ema9")
-    pema21, rema21 = sget(prev, "ema21"), sget(row, "ema21")
-    pbbL, rbbL = sget(prev, "bbL"), sget(row, "bbL")
-    pbbU, rbbU = sget(prev, "bbU"), sget(row, "bbU")
-    rvolsma = sget(row, "volSma20")
-    rvol = sget(row, "volume")
-    rclose = sget(row, "close")
-    rsma50 = sget(row, "sma50")
-    pclose = sget(prev, "close")
-
-    # BUY side
-    rsiReclaim30  = pd.notna(prsi) and pd.notna(rrsi) and prsi < 30 and rrsi >= 30
-    macdBullCross = (pd.notna(pmacd) and pd.notna(pmacds) and pd.notna(pcmacd) and pd.notna(pcmacds)
-                     and pmacd <= pmacds and pcmacd > pcmacds)
-    emaBullCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
-                     and pema9 <= pema21 and rema9 > rema21)
-    bbBullBounce  = pd.notna(pbbL) and pd.notna(rbbL) and pd.notna(pclose) and pd.notna(rclose) and pclose < pbbL and rclose > rbbL
-    volExp        = pd.notna(rvolsma) and pd.notna(rvol) and rvol > rvolsma
-
-    buy_score = (W["RSI"] if rsiReclaim30 else 0) + (W["MACD"] if macdBullCross else 0) + \
-                (W["EMA"] if emaBullCross else 0) + (W["BB"] if bbBullBounce else 0) + (W["VOL"] if volExp else 0)
-    buy_reasons = []
-    if rsiReclaim30:  buy_reasons.append("RSI↑30")
-    if macdBullCross: buy_reasons.append("MACD×")
-    if emaBullCross:  buy_reasons.append("EMA9>21")
-    if bbBullBounce:  buy_reasons.append("BB▲")
-    if volExp:        buy_reasons.append("VOL↑")
-
-    # SELL side
-    rsiFall70     = pd.notna(prsi) and pd.notna(rrsi) and prsi > 70 and rrsi <= 70
-    macdBearCross = (pd.notna(pmacd) and pd.notna(pmacds) and pd.notna(pcmacd) and pd.notna(pcmacds)
-                     and pmacd >= pmacds and pcmacd < pcmacds)
-    emaBearCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
-                     and pema9 >= pema21 and rema9 < rema21)
-    bbBearReject  = pd.notna(pbbU) and pd.notna(rbbU) and pd.notna(pclose) and pd.notna(rclose) and pclose > pbbU and rclose < rbbU
-
-    sell_score = (W["RSI"] if rsiFall70 else 0) + (W["MACD"] if macdBearCross else 0) + \
-                 (W["EMA"] if emaBearCross else 0) + (W["BB"] if bbBearReject else 0) + (W["VOL"] if volExp else 0)
-    sell_reasons = []
-    if rsiFall70:     sell_reasons.append("RSI↓70")
-    if macdBearCross: sell_reasons.append("MACD×")
-    if emaBearCross:  sell_reasons.append("EMA9<21")
-    if bbBearReject:  sell_reasons.append("BB▼")
-    if volExp:        sell_reasons.append("VOL↑")
-
-    # Trend bias
-    trend_up   = pd.notna(rsma50) and pd.notna(rclose) and rclose > rsma50
-    trend_down = pd.notna(rsma50) and pd.notna(rclose) and rclose < rsma50
-    if not trend_up:   buy_score  = 0
-    if not trend_down: sell_score = 0
-
-    return (buy_score, buy_reasons), (sell_score, sell_reasons)
-
-# -------------------- SCAN --------------------
+# ----------------- Scan -----------------
 def scan_once(tickers):
-    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-    all_buys, all_sells = [], []
-    print(f"[scan] scanning {len(tickers)} tickers, timeframe={TIMEFRAME}, lookback={LOOKBACK}")
-
-    for chunk in chunked(tickers, 120):
+    all_buys=[]; all_sells=[]
+    for i in range(0,len(tickers),CHUNK):
+        chunk=tickers[i:i+CHUNK]
+        end=datetime.now(ZoneInfo("America/New_York"))
+        start=end-timedelta(minutes=LOOKBACK*5)
+        req=StockBarsRequest(symbol_or_symbols=chunk,timeframe=TIMEFRAME,start=start,end=end,limit=LOOKBACK)
         try:
-            print(f"[scan] chunk size={len(chunk)}  first={chunk[0]}  last={chunk[-1]}")
-            raw = fetch_history(client, chunk)
+            bars=client.get_stock_bars(req).df
         except Exception as e:
-            print(f"[scan] fetch error: {e}"); time.sleep(1.0); continue
-
-        if raw is None or raw.empty:
-            time.sleep(0.25); continue
-
-        # Normalize to MultiIndex ('symbol', 'timestamp') no matter what we get back
-        raw = normalize_bars_index(raw)
-
-        data = compute_indicators(raw)
-        if data is None or data.empty:
-            time.sleep(0.25); continue
-
-        # We now KNOW data is MultiIndex ('symbol','timestamp'); iterate by symbol (level 0)
-        for sym in data.index.get_level_values(0).unique():
-            df = data.xs(sym, level=0)
-            if not isinstance(df, pd.DataFrame) or df.shape[0] < 3:
-                continue
-
-            # Guard against odd iloc returns
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-            if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
-                continue
-
-            (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)
-            if b_score >= BUY_THRESHOLD:
-                all_buys.append((sym, last.name, float(sget(last, "close")), int(b_score), b_reasons))
-            if s_score >= SELL_THRESHOLD:
-                all_sells.append((sym, last.name, float(sget(last, "close")), int(s_score), s_reasons))
-
-        time.sleep(0.25)  # gentle backoff
-
+            print("[scan] error fetching bars:",e); time.sleep(1); continue
+        if bars is None or bars.empty: continue
+        data=normalize_bars_index(bars)
+        data=compute_indicators(data)
+        if data is None or data.empty: continue
+        idx_names=list(data.index.names)
+        sym_level=0
+        if "symbol" in idx_names: sym_level=idx_names.index("symbol")
+        for sym in data.index.get_level_values(sym_level).unique():
+            df=data.xs(sym,level=sym_level)
+            if not isinstance(df,pd.DataFrame) or df.shape[0]<3: continue
+            last, prev=df.iloc[-1], df.iloc[-2]
+            (b_score,b_reasons),(s_score,s_reasons)=score_row(last,prev)
+            last_px=float(sget(last,"close"))
+            if b_score>=BUY_THRESHOLD:
+                tg=build_targets(df,"BUY",last_px)
+                all_buys.append((sym,last.name,last_px,int(b_score),b_reasons,tg))
+            if s_score>=SELL_THRESHOLD:
+                tg=build_targets(df,"SELL",last_px)
+                all_sells.append((sym,last.name,last_px,int(s_score),s_reasons,tg))
+        time.sleep(0.25)
     return all_buys, all_sells
 
-_last_fire = defaultdict(lambda: 0)  # in-process cooldown
+# ----------------- State -----------------
+STATE_FILE="state/state.json"
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try: return json.load(open(STATE_FILE,"r"))
+        except: return {}
+    return {}
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE),exist_ok=True)
+    json.dump(state,open(STATE_FILE,"w"))
 
-# -------------------- NOTIFY (with BUY→SELL P&L) --------------------
+# ----------------- Notify -----------------
+def notify_discord(msg: str):
+    if not DISCORD_WEBHOOK_URL: return
+    try: requests.post(DISCORD_WEBHOOK_URL,json={"content":msg})
+    except Exception as e: print("[notify] error",e)
+
+# ----------------- Main -----------------
 def run_and_notify():
-    state = load_state()
-    tickers = read_tickers_from_csv(CSV_PATH)
-    buys, sells = scan_once(tickers)
-
-    now = time.time()
-    def filter_cooldown(events, tag):
-        out = []
-        for sym, ts, px, score, reasons in events:
-            key = f"{tag}:{sym}"
-            if now - _last_fire[key] >= COOLDOWN_SEC:
-                _last_fire[key] = now
-                out.append((sym, ts, px, score, reasons))
-        return out
-
-    buys  = filter_cooldown(buys,  "BUY")
-    sells = filter_cooldown(sells, "SELL")
-
-    # record BUYs
-    for sym, ts, px, score, reasons in buys:
-        try:
-            ts_iso = pd.Timestamp(ts).isoformat()
-        except Exception:
-            ts_iso = str(ts)
-        state[sym] = {"buy_px": float(px), "buy_ts": ts_iso}
-
-    lines, has_lines = ["**Confluence Signals**"], False
+    tickers=pd.read_csv("nasdaqlisted.csv")["Symbol"].tolist()
+    tickers=[t for t in tickers if pd.notna(t)]
+    print(f"[tickers] loaded {len(tickers)} symbols from nasdaqlisted.csv")
+    buys,sells=scan_once(tickers)
+    state=load_state(); lines=["**Confluence Signals**"]
     if buys:
-        has_lines = True
-        lines.append("**BUY**")
-        lines.append("")  # blank line for Discord readability
-        for sym, ts, px, score, reasons in buys:
-            reason_str = ", ".join(reasons) if reasons else "-"
-            lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]")
-
+        lines.append("**BUY**"); lines.append("")
+        for sym,ts,px,score,reasons,tg in buys:
+            reason_str=", ".join(reasons) if reasons else "-"
+            tgt=""
+            if tg:
+                s=tg.get("stop"); t1=tg.get("t1"); t2=tg.get("t2")
+                parts=[]
+                if t1: parts.append(f"T1 ${t1:.2f}")
+                if t2: parts.append(f"T2 ${t2:.2f}")
+                if s: parts.append(f"Stop ${s:.2f}")
+                if parts: tgt="  "+", ".join(parts)
+            lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]{tgt}")
+            state[sym]={"buy_px":px,"buy_ts":str(ts)}
     if sells:
-        has_lines = True
-        lines.append("**SELL**")
-        lines.append("")
-        for sym, ts, px, score, reasons in sells:
-            reason_str = ", ".join(reasons) if reasons else "-"
-            growth_note = ""
+        lines.append("**SELL**"); lines.append("")
+        for sym,ts,px,score,reasons,tg in sells:
+            reason_str=", ".join(reasons) if reasons else "-"
+            tgt=""
+            if tg:
+                s=tg.get("stop"); t1=tg.get("t1"); t2=tg.get("t2")
+                parts=[]
+                if t1: parts.append(f"T1 ${t1:.2f}")
+                if t2: parts.append(f"T2 ${t2:.2f}")
+                if s: parts.append(f"Stop ${s:.2f}")
+                if parts: tgt="  "+", ".join(parts)
+            growth_note=""
             if sym in state and "buy_px" in state[sym]:
-                buy_px = state[sym]["buy_px"]
-                if buy_px and buy_px > 0:
-                    pct = (px / buy_px - 1.0) * 100.0
-                    buy_ts = state[sym].get("buy_ts", "")
-                    sign = "+" if pct >= 0 else ""
-                    growth_note = f" [{sign}{pct:.2f}% since BUY @ ${buy_px:.2f} on {buy_ts}]"
-                # Clear after pairing
-                state.pop(sym, None)
-            lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]{growth_note}")
-
+                buy_px=state[sym]["buy_px"]
+                if buy_px and buy_px>0:
+                    pct=(px/buy_px-1.0)*100.0
+                    buy_ts=state[sym].get("buy_ts","")
+                    sign="+" if pct>=0 else ""
+                    growth_note=f" [{sign}{pct:.2f}% since BUY @ ${buy_px:.2f} on {buy_ts}]"
+                state.pop(sym,None)
+            lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]{growth_note}{tgt}")
+    if len(lines)>1: notify_discord("\n".join(lines))
+    else: print("[notify] No signals this run.")
     save_state(state)
 
-    if has_lines:
-        msg = "\n".join(lines)
-        if len(msg) > 1800:
-            discord("**Confluence Signals**")
-            chunk = ""
-            for line in lines[1:]:
-                if len(chunk) + len(line) + 1 > 1800:
-                    discord(chunk); chunk = line
-                else:
-                    chunk = line if not chunk else f"{chunk}\n{line}"
-            if chunk: discord(chunk)
-        else:
-            discord(msg)
-    else:
-        print("[notify] No signals this run.")
-
-# -------------------- DIGEST --------------------
-def digest():
-    tickers = read_tickers_from_csv(CSV_PATH)
-    buys, sells = scan_once(tickers)
-    buys = sorted(buys, key=lambda x: x[3], reverse=True)[:10]
-    sells = sorted(sells, key=lambda x: x[3], reverse=True)[:10]
-    lines = ["**Close Digest — Top Confluence**"]
-    if buys:
-        lines.append("**BUY**")
-        lines.append("")
-        for s, ts, px, sc, rs in buys:
-            reason_str = ", ".join(rs) if rs else "-"
-            lines.append(f"- {s} — ${px:.2f} (score {sc}) [{reason_str}]")
-    if sells:
-        lines.append("**SELL**")
-        lines.append("")
-        for s, ts, px, sc, rs in sells:
-            reason_str = ", ".join(rs) if rs else "-"
-            lines.append(f"- {s} — ${px:.2f} (score {sc}) [{reason_str}]")
-    msg = "\n".join(lines) if len(lines) > 1 else "No high scores today."
-    discord(msg)
-
-# -------------------- MAIN --------------------
-if __name__ == "__main__":
-    if "--digest" in sys.argv:
-        digest()
-    else:
-        run_and_notify()
+if __name__=="__main__":
+    run_and_notify()

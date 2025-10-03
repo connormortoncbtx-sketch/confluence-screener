@@ -1,4 +1,4 @@
-# Confluence Screener — Discord Alerts (no pandas-ta; indicators via pandas)
+# Confluence Screener — Discord Alerts (pure pandas indicators, robust to Alpaca index order)
 # Features:
 # - Confluence alerts (RSI/MACD/EMA/Bollinger/Volume) with 50-SMA trend bias
 # - Discord alerts with reason codes
@@ -6,6 +6,8 @@
 # - Gentler batching + backoff (rate-limit friendly)
 # - Daily digest mode: `python confluence_screener.py --digest`
 # - Persists last BUY; on SELL reports % change since BUY (state/ cache)
+# - Robust to Alpaca MultiIndex order (symbol/timestamp vs timestamp/symbol)
+# - Safe guards against odd row shapes
 
 import os, time, ssl, smtplib, csv, requests, sys, json
 from email.mime.text import MIMEText
@@ -33,7 +35,7 @@ STATE_DIR = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH = STATE_DIR / "state.json"  # { "AAPL": {"buy_px": ..., "buy_ts": "..." } }
 
 # -------------------- SCAN CONFIG --------------------
-TIMEFRAME = TimeFrame(5, TimeFrameUnit.Minute)   # ✅ fixed
+TIMEFRAME = TimeFrame(5, TimeFrameUnit.Minute)   # 5-minute bars
 LOOKBACK  = 400
 
 W = dict(RSI=25, MACD=25, EMA=25, BB=15, VOL=10)
@@ -46,15 +48,6 @@ USE_EMAIL = False
 SMTP_HOST, SMTP_PORT = "smtp.gmail.com", 465
 EMAIL_FROM, EMAIL_TO = "you@example.com", ["you@example.com"]
 EMAIL_USER, EMAIL_PASS = "you@example.com", "APP_PASSWORD_HERE"
-
-def sget(row, key):
-    """Safe getter for a pandas Series-like row; returns pd.NA if missing."""
-    try:
-        if isinstance(row, pd.Series) and key in row.index:
-            return row[key]
-    except Exception:
-        pass
-    return pd.NA
 
 def email(subject, html):
     if not USE_EMAIL: return
@@ -100,7 +93,7 @@ def read_tickers_from_csv(path: Path):
     name_cols = [c for c in df.columns if c.lower() in ["security name","name","description","company name","issuer name"]]
     if name_cols:
         nm = df[name_cols[0]].astype(str).str.lower()
-        # ✅ regex changed to non-capturing
+        # non-capturing group + na=False to avoid warnings/NaNs
         mask = ~nm.str.contains(r"\b(?:etf|trust|fund|warrant|unit|spac)\b", regex=True, na=False)
         df = df[mask]
 
@@ -144,9 +137,10 @@ def bollinger(close: pd.Series, length=20, mult=2.0):
 
 def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
     out = []
+    # Detect which level is symbol if names are present; otherwise we will handle in scan_once
     for sym in df_multi.index.get_level_values(0).unique():
         sub = df_multi.xs(sym).copy()
-        if len(sub) < 50: 
+        if len(sub) < 50:
             continue
         sub["rsi"] = rsi_wilder(sub["close"], 14)
         sub["macd"], sub["macds"] = macd_series(sub["close"], 12, 26, 9)
@@ -155,7 +149,6 @@ def compute_indicators(df_multi: pd.DataFrame) -> pd.DataFrame:
         sub["bbL"], sub["bbU"] = bollinger(sub["close"], 20, 2.0)
         sub["volSma20"] = sma(sub["volume"], 20)
         sub["sma50"] = sma(sub["close"], 50)
-        sub["symbol"] = sym
         out.append(sub)
     return pd.concat(out).sort_index() if out else pd.DataFrame()
 
@@ -168,13 +161,23 @@ def fetch_history(client, tickers):
     req = StockBarsRequest(symbol_or_symbols=tickers, timeframe=TIMEFRAME, limit=LOOKBACK)
     return client.get_stock_bars(req).df
 
+# -------------------- SAFE ACCESS HELPERS --------------------
+def sget(row, key):
+    """Safe getter for a pandas Series-like row; returns pd.NA if missing or wrong type."""
+    try:
+        if isinstance(row, pd.Series) and key in row.index:
+            return row[key]
+    except Exception:
+        pass
+    return pd.NA
+
 # -------------------- SIGNALS --------------------
 def score_row(row, prev):
     # Short-circuit if we didn't get proper Series rows
     if not isinstance(row, pd.Series) or not isinstance(prev, pd.Series):
         return (0, []), (0, [])
 
-    # Read needed fields safely
+    # Safely read all fields
     prsi, rrsi = sget(prev, "rsi"), sget(row, "rsi")
     pmacd, pcmacd = sget(prev, "macd"), sget(row, "macd")
     pmacds, pcmacds = sget(prev, "macds"), sget(row, "macds")
@@ -186,6 +189,7 @@ def score_row(row, prev):
     rvol = sget(row, "volume")
     rclose = sget(row, "close")
     rsma50 = sget(row, "sma50")
+    pclose = sget(prev, "close")
 
     # BUY side
     rsiReclaim30  = pd.notna(prsi) and pd.notna(rrsi) and prsi < 30 and rrsi >= 30
@@ -193,7 +197,7 @@ def score_row(row, prev):
                      and pmacd <= pmacds and pcmacd > pcmacds)
     emaBullCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
                      and pema9 <= pema21 and rema9 > rema21)
-    bbBullBounce  = pd.notna(pbbL) and pd.notna(rbbL) and sget(prev, "close") < pbbL and rclose > rbbL
+    bbBullBounce  = pd.notna(pbbL) and pd.notna(rbbL) and pd.notna(pclose) and pd.notna(rclose) and pclose < pbbL and rclose > rbbL
     volExp        = pd.notna(rvolsma) and pd.notna(rvol) and rvol > rvolsma
 
     buy_score = (W["RSI"] if rsiReclaim30 else 0) + (W["MACD"] if macdBullCross else 0) + \
@@ -211,7 +215,7 @@ def score_row(row, prev):
                      and pmacd >= pmacds and pcmacd < pcmacds)
     emaBearCross  = (pd.notna(pema9) and pd.notna(pema21) and pd.notna(rema9) and pd.notna(rema21)
                      and pema9 >= pema21 and rema9 < rema21)
-    bbBearReject  = pd.notna(pbbU) and pd.notna(rbbU) and sget(prev, "close") > pbbU and rclose < rbbU
+    bbBearReject  = pd.notna(pbbU) and pd.notna(rbbU) and pd.notna(pclose) and pd.notna(rclose) and pclose > pbbU and rclose < rbbU
 
     sell_score = (W["RSI"] if rsiFall70 else 0) + (W["MACD"] if macdBearCross else 0) + \
                  (W["EMA"] if emaBearCross else 0) + (W["BB"] if bbBearReject else 0) + (W["VOL"] if volExp else 0)
@@ -229,7 +233,6 @@ def score_row(row, prev):
     if not trend_down: sell_score = 0
 
     return (buy_score, buy_reasons), (sell_score, sell_reasons)
-
 
 # -------------------- SCAN --------------------
 def scan_once(tickers):
@@ -251,27 +254,42 @@ def scan_once(tickers):
         if data is None or data.empty:
             time.sleep(0.25); continue
 
-        for sym in data.index.get_level_values(0).unique():
-            df = data.xs(sym)
+        # ---------- Robust symbol-level detection ----------
+        idx_names = list(data.index.names)
+        if "symbol" in idx_names:
+            sym_level = idx_names.index("symbol")
+        else:
+            # Fallback: choose the non-datetime level as symbol
+            levels = data.index.levels
+            # Some SDK versions may have unnamed levels; detect dtype
+            lv0_is_dt = pd.api.types.is_datetime64_any_dtype(levels[0])
+            lv1_is_dt = pd.api.types.is_datetime64_any_dtype(levels[1])
+            if lv0_is_dt and not lv1_is_dt:
+                sym_level = 1
+            elif lv1_is_dt and not lv0_is_dt:
+                sym_level = 0
+            else:
+                sym_level = 0  # last resort
+
+        for sym in data.index.get_level_values(sym_level).unique():
+            df = data.xs(sym, level=sym_level)
             if not isinstance(df, pd.DataFrame) or df.shape[0] < 3:
                 continue
 
-    # some weird returns can still yield Series on iloc; guard it
+            # Guard against odd iloc returns
             last = df.iloc[-1]
             prev = df.iloc[-2]
             if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
-        # Log and skip this symbol cleanly
-        # print(f"[scan] skip {sym}: unexpected row type")
+                # print(f"[scan] skip {sym}: unexpected row type")
                 continue
 
             (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)
             if b_score >= BUY_THRESHOLD:
-                all_buys.append((sym, last.name, float(last["close"]), int(b_score), b_reasons))
+                all_buys.append((sym, last.name, float(sget(last, "close")), int(b_score), b_reasons))
             if s_score >= SELL_THRESHOLD:
-                all_sells.append((sym, last.name, float(last["close"]), int(s_score), s_reasons))
+                all_sells.append((sym, last.name, float(sget(last, "close")), int(s_score), s_reasons))
 
-
-        time.sleep(0.25)  # backoff
+        time.sleep(0.25)  # gentle backoff
 
     return all_buys, all_sells
 
@@ -298,17 +316,25 @@ def run_and_notify():
 
     # record BUYs
     for sym, ts, px, score, reasons in buys:
-        state[sym] = {"buy_px": float(px), "buy_ts": pd.Timestamp(ts).isoformat()}
+        try:
+            ts_iso = pd.Timestamp(ts).isoformat()
+        except Exception:
+            ts_iso = str(ts)
+        state[sym] = {"buy_px": float(px), "buy_ts": ts_iso}
 
     lines, has_lines = ["**Confluence Signals**"], False
     if buys:
-        has_lines = True; lines.append("**BUY**")
+        has_lines = True
+        lines.append("**BUY**")
+        lines.append("")  # blank line for Discord readability
         for sym, ts, px, score, reasons in buys:
             reason_str = ", ".join(reasons) if reasons else "-"
             lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]")
 
     if sells:
-        has_lines = True; lines.append("**SELL**")
+        has_lines = True
+        lines.append("**SELL**")
+        lines.append("")
         for sym, ts, px, score, reasons in sells:
             reason_str = ", ".join(reasons) if reasons else "-"
             growth_note = ""
@@ -317,8 +343,10 @@ def run_and_notify():
                 if buy_px and buy_px > 0:
                     pct = (px / buy_px - 1.0) * 100.0
                     buy_ts = state[sym].get("buy_ts", "")
-                    growth_note = f" [+{pct:.2f}% since BUY @ ${buy_px:.2f} on {buy_ts}]"
-                    del state[sym]  # reset after paired SELL
+                    sign = "+" if pct >= 0 else ""
+                    growth_note = f" [{sign}{pct:.2f}% since BUY @ ${buy_px:.2f} on {buy_ts}]"
+                # Clear after pairing
+                state.pop(sym, None)
             lines.append(f"- {sym} @ {ts} — ${px:.2f} (score {score}) [{reason_str}]{growth_note}")
 
     save_state(state)
@@ -348,11 +376,13 @@ def digest():
     lines = ["**Close Digest — Top Confluence**"]
     if buys:
         lines.append("**BUY**")
+        lines.append("")
         for s, ts, px, sc, rs in buys:
             reason_str = ", ".join(rs) if rs else "-"
             lines.append(f"- {s} — ${px:.2f} (score {sc}) [{reason_str}]")
     if sells:
         lines.append("**SELL**")
+        lines.append("")
         for s, ts, px, sc, rs in sells:
             reason_str = ", ".join(rs) if rs else "-"
             lines.append(f"- {s} — ${px:.2f} (score {sc}) [{reason_str}]")

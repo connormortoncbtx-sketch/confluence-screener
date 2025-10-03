@@ -68,11 +68,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Set environment
+      - name: Export secrets to env
         run: |
+          echo "FINNHUB_API_KEY=${{ secrets.FINNHUB_API_KEY }}" >> $GITHUB_ENV
           echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}" >> $GITHUB_ENV
           echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> $GITHUB_ENV
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
+
 
 
       - name: Run screener

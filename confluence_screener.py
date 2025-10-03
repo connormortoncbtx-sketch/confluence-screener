@@ -163,22 +163,67 @@ def median_ignore_nans(vals):
     return float(pd.Series(vals).median())
 
 def build_targets(df_symbol: pd.DataFrame, side: str, last_close: float):
-    if df_symbol is None or df_symbol.shape[0] < 30 or pd.isna(last_close): return {}
-    a = float(atr(df_symbol,14).iloc[-1]) if df_symbol.shape[0]>=14 else None
-    d_hi,d_lo = donchian_levels(df_symbol,20)
+    if df_symbol is None or df_symbol.shape[0] < 30 or pd.isna(last_close):
+        return {}
+
+    a = float(atr(df_symbol, 14).iloc[-1]) if df_symbol.shape[0] >= 14 else None
+    d_hi, d_lo = donchian_levels(df_symbol, 20)
     pr = prior_day_hlc(df_symbol)
     piv = classic_pivots(*pr) if pr else None
-    sw_lo, sw_hi = recent_swing(df_symbol["close"],80)
-    fibs = fib_levels_from_swing(sw_lo,sw_hi) if sw_hi>sw_lo else None
-    if side=="BUY":
-        stop=min([fibs.get("23.6%") if fibs else None,d_lo,piv.get("S1") if piv else None,last_close-(1.0*a) if a else None],default=None)
-        t1=median_ignore_nans([fibs.get("38.2%") if fibs else None,d_hi,piv.get("R1") if piv else None,last_close+(1.0*a) if a else None])
-        t2=median_ignore_nans([fibs.get("61.8%") if fibs else None,piv.get("R2") if piv else None,last_close+(1.5*a) if a else None,fibs.get("127.2%") if fibs else None])
-    else:
-        stop=max([fibs.get("23.6%") if fibs else None,d_hi,piv.get("R1") if piv else None,last_close+(1.0*a) if a else None],default=None)
-        t1=median_ignore_nans([fibs.get("61.8%") if fibs else None,d_lo,piv.get("S1") if piv else None,last_close-(1.0*a) if a else None])
-        t2=median_ignore_nans([fibs.get("78.6%") if fibs else None,piv.get("S2") if piv else None,last_close-(1.5*a) if a else None,fibs.get("161.8%") if fibs else None])
-    return {"stop":stop,"t1":t1,"t2":t2}
+    sw_lo, sw_hi = recent_swing(df_symbol["close"], 80)
+    fibs = fib_levels_from_swing(sw_lo, sw_hi) if sw_hi > sw_lo else None
+
+    def clean(vals):
+        return [v for v in vals if v is not None and not pd.isna(v)]
+
+    if side == "BUY":
+        stop_candidates = clean([
+            fibs.get("23.6%") if fibs else None,
+            d_lo,
+            piv.get("S1") if piv else None,
+            last_close - (1.0 * a) if a else None,
+        ])
+        t1_candidates = clean([
+            fibs.get("38.2%") if fibs else None,
+            d_hi,
+            piv.get("R1") if piv else None,
+            last_close + (1.0 * a) if a else None,
+        ])
+        t2_candidates = clean([
+            fibs.get("61.8%") if fibs else None,
+            piv.get("R2") if piv else None,
+            last_close + (1.5 * a) if a else None,
+            fibs.get("127.2%") if fibs else None,
+        ])
+        stop = min(stop_candidates) if stop_candidates else None
+        t1 = median_ignore_nans(t1_candidates)
+        t2 = median_ignore_nans(t2_candidates)
+
+    else:  # SELL
+        stop_candidates = clean([
+            fibs.get("23.6%") if fibs else None,
+            d_hi,
+            piv.get("R1") if piv else None,
+            last_close + (1.0 * a) if a else None,
+        ])
+        t1_candidates = clean([
+            fibs.get("61.8%") if fibs else None,
+            d_lo,
+            piv.get("S1") if piv else None,
+            last_close - (1.0 * a) if a else None,
+        ])
+        t2_candidates = clean([
+            fibs.get("78.6%") if fibs else None,
+            piv.get("S2") if piv else None,
+            last_close - (1.5 * a) if a else None,
+            fibs.get("161.8%") if fibs else None,
+        ])
+        stop = max(stop_candidates) if stop_candidates else None
+        t1 = median_ignore_nans(t1_candidates)
+        t2 = median_ignore_nans(t2_candidates)
+
+    return {"stop": stop, "t1": t1, "t2": t2}
+
 
 # ----------------- Scoring -----------------
 def score_row(row, prev):

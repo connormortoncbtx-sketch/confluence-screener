@@ -2,24 +2,20 @@ name: Confluence Screener
 
 on:
   schedule:
-    # Every 15 minutes Mon–Fri
-    - cron: "*/15 * * * 1-5"
+    # US Daylight Time: 9:30–16:00 ET == 13:30–20:00 UTC
+    - cron: "*/15 13-20 * * 1-5"
+    # US Standard Time: 9:30–16:00 ET == 14:30–21:00 UTC
+    - cron: "*/15 14-21 * * 1-5"
   workflow_dispatch: {}
 
-concurrency:
-  group: confluence-screener
-  cancel-in-progress: true
-
 jobs:
-  run:
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    outputs:
+      open: ${{ steps.gate.outputs.open }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check if US market is open now (holiday-aware)
-        id: market_open
+      - name: Gate (NY hours + holiday-aware)
+        id: gate
         run: |
           python - << 'PY'
           from datetime import datetime, time
@@ -38,12 +34,23 @@ jobs:
               is_holiday = False
           open_now = is_weekday and in_hours and not is_holiday
           print("Market open:", open_now, "Holiday:", is_holiday, "NY:", now)
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"open={'true' if open_now else 'false'}\n")
           PY
 
+  run:
+    needs: gate
+    if: needs.gate.outputs.open == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: confluence-screener
+      cancel-in-progress: true
+
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Restore state cache
-        if: steps.market_open.outputs.open == 'true'
         uses: actions/cache/restore@v4
         with:
           path: state
@@ -52,30 +59,25 @@ jobs:
             state-v1-
 
       - name: Set up Python
-        if: steps.market_open.outputs.open == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
-        if: steps.market_open.outputs.open == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Create .env
-        if: steps.market_open.outputs.open == 'true'
         run: |
           echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}" >> .env
           echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> .env
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> .env
 
       - name: Run screener
-        if: steps.market_open.outputs.open == 'true'
         run: python confluence_screener.py
 
       - name: Save state cache
-        if: steps.market_open.outputs.open == 'true'
         uses: actions/cache/save@v4
         with:
           path: state

@@ -421,12 +421,24 @@ def scan_once(tickers: list[str]):
     """
     Returns (buys, sells).
     Each element: (symbol, timestamp, price, score, reasons, targets_dict)
+
+    Adds lightweight diagnostics:
+    - provider/slice/offset banner
+    - per-provider fetch counts (ok/empty/errors)
+    - debug sample of the first good DataFrame (3 rows + columns + date range)
+    - per-run summary (symbols scanned, skipped-short, buy/sell counts)
+    Enable extra logs by setting env DEBUG=1.
     """
+    debug = os.getenv("DEBUG", "0") == "1"
+
     all_buys, all_sells = [], []
 
-    # Rotation slice
+    # ---- rotation slice ----
     N = len(tickers)
-    if N == 0: return all_buys, all_sells
+    if N == 0:
+        print("[scan] no tickers supplied")
+        return all_buys, all_sells
+
     offset = load_offset() % N
     end_ix = offset + SCAN_LIMIT
     if end_ix <= N:
@@ -439,48 +451,112 @@ def scan_once(tickers: list[str]):
 
     print(f"[scan] provider={DATA_PROVIDER}  slice={len(universe)}  offset={offset}→{next_offset}  timeframe={TIMEFRAME_MINUTES}Min  lookback={LOOKBACK}")
 
+    # ---- fetch bars ----
+    fetched_ok = 0
+    fetched_empty = 0
+    fetch_errors = 0
+    sample_logged = False
+
     if DATA_PROVIDER == "finnhub":
-        # One call per symbol; pace at ~50/min
         frames = []
         for i, sym in enumerate(universe, 1):
             df = get_bars_finnhub(sym)
-            if df is not None and not df.empty:
+            if df is None:
+                fetch_errors += 1
+            elif df.empty:
+                fetched_empty += 1
+            else:
                 frames.append(df)
+                fetched_ok += 1
+                # one-time debug sample
+                if debug and not sample_logged:
+                    print("[debug] sample symbol:", sym)
+                    try:
+                        print("[debug] first 3 rows:\n", df.head(3).to_string())
+                        print("[debug] columns:", list(df.columns))
+                        ts = df.index.get_level_values("timestamp")
+                        print("[debug] date range:", ts.min(), "→", ts.max())
+                    except Exception as e:
+                        print("[debug] sample log error:", e)
+                    sample_logged = True
+
+            # pace ~50/min
             if i % FINNHUB_CALLS_PER_MIN == 0:
-                # brief pause each batch of 50 to stay under per-minute limit
                 time.sleep(1.0)
             else:
                 time.sleep(FINNHUB_DELAY_SEC)
+
         if not frames:
+            print(f"[scan] no frames collected (ok={fetched_ok}, empty={fetched_empty}, errors={fetch_errors})")
             return all_buys, all_sells
+
         bars = pd.concat(frames).sort_index()
+
     else:
-        # Alpaca IEX fallback, in chunks (kept for completeness)
+        # Alpaca IEX fallback in chunks
         bars_list = []
         for i in range(0, len(universe), 120):
             chunk = universe[i:i+120]
             print(f"[scan] alpaca chunk {i//120+1}: {chunk[0]}..{chunk[-1]} ({len(chunk)})")
-            df = get_bars_alpaca(chunk)
-            if df is not None and not df.empty:
+            try:
+                df = get_bars_alpaca(chunk)
+            except Exception as e:
+                print("[scan] alpaca fetch exception:", e)
+                df = None
+            if df is None:
+                fetch_errors += 1
+            elif df.empty:
+                fetched_empty += 1
+            else:
                 bars_list.append(df)
+                fetched_ok += 1
+                if debug and not sample_logged:
+                    print("[debug] first 3 rows:\n", df.head(3).to_string())
+                    print("[debug] columns:", list(df.columns))
+                    ts = df.index.get_level_values("timestamp")
+                    print("[debug] date range:", ts.min(), "→", ts.max())
+                    sample_logged = True
             time.sleep(0.25)
         if not bars_list:
+            print(f"[scan] no frames collected (ok={fetched_ok}, empty={fetched_empty}, errors={fetch_errors})")
             return all_buys, all_sells
         bars = pd.concat(bars_list).sort_index()
 
-    # Indicators
-    data = compute_indicators(bars)
-    if data is None or data.empty:
+    # Normalize (defensive; Finnhub already returns MultiIndex)
+    bars = normalize_to_multi(bars)
+    if bars is None or bars.empty:
+        print("[scan] normalized bars empty")
         return all_buys, all_sells
 
+    # ---- indicators ----
+    data = compute_indicators(bars)
+    if data is None or data.empty:
+        print("[scan] indicators produced empty dataframe")
+        return all_buys, all_sells
+
+    # extra debug: show last 2 rows for one symbol after indicators
+    if debug:
+        try:
+            sym0 = data.index.get_level_values(0).unique()[0]
+            df0 = data.xs(sym0, level=0).tail(2)
+            print("[debug] post-indicators sample for", sym0)
+            print(df0.to_string())
+        except Exception as e:
+            print("[debug] post-indicators sample error:", e)
+
+    # ---- per-symbol scan ----
+    skipped_short = 0
     for sym in data.index.get_level_values(0).unique():
         df_sym = data.xs(sym, level=0)
-        if not isinstance(df_sym, pd.DataFrame) or df_sym.shape[0] < 3:
+        if not isinstance(df_sym, pd.DataFrame) or df_sym.shape[0] < 30:
+            skipped_short += 1
             continue
+
         last = df_sym.iloc[-1]
         prev = df_sym.iloc[-2]
         if not isinstance(last, pd.Series) or not isinstance(prev, pd.Series):
             continue
+
         (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev)
         last_px = float(last.get("close", np.nan))
         if pd.isna(last_px):
@@ -493,6 +569,13 @@ def scan_once(tickers: list[str]):
         if s_score >= SELL_THRESHOLD:
             tg = build_targets(df_sym, side="SELL", last_close=last_px)
             all_sells.append((sym, last.name, last_px, int(s_score), s_reasons, tg))
+
+    # ---- summary ----
+    print(
+        f"[scan] fetch ok={fetched_ok}, empty={fetched_empty}, errors={fetch_errors} | "
+        f"scanned={len(universe)}, skipped_short={skipped_short}, "
+        f"buys={len(all_buys)}, sells={len(all_sells)}"
+    )
 
     return all_buys, all_sells
 

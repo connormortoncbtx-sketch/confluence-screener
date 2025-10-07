@@ -2,7 +2,7 @@ name: Confluence Screener
 
 on:
   schedule:
-    # Every 20 minutes, Mon–Fri (all day; we skip inside the job when market is closed)
+    # Every 20 minutes Mon–Fri (UTC). The job itself decides whether to run.
     - cron: "*/20 * * * 1-5"
   workflow_dispatch: {}
 
@@ -13,11 +13,13 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 45 minutes gives ample room for SCAN_LIMIT≈600 (≈12–15 min typical), without risking long hangs.
     timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Kickoff marker
+        run: echo "Run started: $(date -u) UTC"
 
       - name: Check if US market is open now (holiday-aware)
         id: market_open
@@ -50,7 +52,6 @@ jobs:
           echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}" >> $GITHUB_ENV
           echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> $GITHUB_ENV
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
-          # Optional: force provider & rotation slice size here instead of repo settings
           echo "DATA_PROVIDER=finnhub" >> $GITHUB_ENV
           echo "SCAN_LIMIT=600" >> $GITHUB_ENV
 

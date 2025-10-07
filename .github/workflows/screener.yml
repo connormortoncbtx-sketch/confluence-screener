@@ -57,6 +57,7 @@ jobs:
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
           echo "DATA_PROVIDER=finnhub" >> $GITHUB_ENV
           echo "SCAN_LIMIT=600" >> $GITHUB_ENV
+          echo "DEBUG=1" >> $GITHUB_ENV
 
       - name: Restore state cache
         if: steps.market_open.outputs.open == 'true'

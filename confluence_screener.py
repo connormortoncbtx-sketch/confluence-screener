@@ -46,6 +46,11 @@ ALPACA_API_KEY      = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
+# Startup key check — helps diagnose auth failures locally
+print(f"[keys] ALPACA_API_KEY={'SET' if ALPACA_API_KEY else 'MISSING'} "
+      f"ALPACA_SECRET_KEY={'SET' if ALPACA_SECRET_KEY else 'MISSING'} "
+      f"FINNHUB_API_KEY={'SET' if FINNHUB_API_KEY else 'MISSING'}")
+
 # CRYPTO_MODE=1 switches the entire pipeline to crypto:
 #   - reads cryptolisted.csv instead of nasdaqlisted.csv
 #   - uses CryptoHistoricalDataClient + CryptoBarsRequest

@@ -28,7 +28,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Kickoff marker
-        run: echo "Equity run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        run: |
+          echo "Equity run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
       - name: Check if US market is open (holiday-aware)
         id: market_open
@@ -103,7 +104,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Kickoff marker
-        run: echo "Crypto run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        run: |
+          echo "Crypto run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
       - name: Export secrets to env
         run: |

@@ -38,22 +38,37 @@ ALPACA_API_KEY      = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY   = os.getenv("ALPACA_SECRET_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-CSV_PATH    = Path("nasdaqlisted.csv")
+# CRYPTO_MODE=1 switches the entire pipeline to crypto:
+#   - reads cryptolisted.csv instead of nasdaqlisted.csv
+#   - uses CryptoHistoricalDataClient + CryptoBarsRequest
+#   - uses longer timeframe and higher thresholds (crypto is more volatile)
+#   - namespaces all state keys with "_cx_" so equity/crypto ledgers never mix
+#   - skips MIN_PRICE and MIN_VOL_MA filters (irrelevant for crypto)
+CRYPTO_MODE = os.getenv("CRYPTO_MODE", "0") == "1"
+
+CSV_PATH    = Path("cryptolisted.csv") if CRYPTO_MODE else Path("nasdaqlisted.csv")
 STATE_DIR   = Path("state"); STATE_DIR.mkdir(parents=True, exist_ok=True)
 STATE_PATH  = STATE_DIR / "state.json"
-ROTATE_PATH = STATE_DIR / "scan_offset.json"
+ROTATE_PATH = STATE_DIR / ("crypto_offset.json" if CRYPTO_MODE else "scan_offset.json")
+
+# State key prefix — keeps equity and crypto positions/trades/weights separate
+# in the same state.json file without collision.
+SK = "_cx_" if CRYPTO_MODE else "_"
 
 # --------- Scan Config ----------
-TIMEFRAME_MINUTES = 5
+# Crypto uses 15-min bars (5-min is too noisy for volatile assets) and
+# higher score thresholds to reduce false positives.
+TIMEFRAME_MINUTES = int(os.getenv("TIMEFRAME_MINUTES", "15" if CRYPTO_MODE else "5"))
 LOOKBACK          = 400
-BUY_THRESHOLD     = int(os.getenv("BUY_THRESHOLD",  "60"))
-SELL_THRESHOLD    = int(os.getenv("SELL_THRESHOLD", "60"))
+BUY_THRESHOLD     = int(os.getenv("BUY_THRESHOLD",  "70" if CRYPTO_MODE else "60"))
+SELL_THRESHOLD    = int(os.getenv("SELL_THRESHOLD", "70" if CRYPTO_MODE else "60"))
 
 FINNHUB_CALLS_PER_MIN = 50
 ALPACA_CALLS_PER_MIN  = int(os.getenv("ALPACA_CALLS_PER_MIN", "180"))
 SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "9999"))
 COOLDOWN_SEC          = 30 * 60
 
+# Equity filters — not applied in crypto mode (different volume units, SHIB < $0.01)
 MIN_PRICE  = float(os.getenv("MIN_PRICE",  "5.0"))
 MIN_VOL_MA = float(os.getenv("MIN_VOL_MA", "5000"))
 
@@ -70,7 +85,7 @@ WEIGHT_MAX        = 45
 WEIGHT_STEP       = 3
 MAX_TRADES_STORED = 500
 
-# Default weights — overridden by state["_weights"] after adaptation.
+# Default weights — overridden by state[SK+"weights"] after adaptation.
 # MACD raised (strongest independent intraday signal),
 # RSI lowered (most collinear with MACD/EMA on 5-min bars). Total = 100.
 W_DEFAULT = dict(RSI=20, MACD=30, EMA=25, BB=15, VOL=10)
@@ -303,7 +318,7 @@ def score_row(row, prev, prev2, daily_trend: str = "neutral"):
     Every signal requires: prev2 was wrong side, prev crossed, row still holds.
     Volume is directional: up-bar -> buy only, down-bar -> sell only.
     Daily trend gates: 'up' suppresses sells, 'down' suppresses buys.
-    W is adaptive (updated from state["_weights"] at runtime).
+    W is adaptive (updated from state[SK+"weights"] at runtime).
     """
     buy_score = sell_score = 0
     buy_reasons, sell_reasons = [], []
@@ -358,7 +373,7 @@ def score_row(row, prev, prev2, daily_trend: str = "neutral"):
 
 def close_trade(state: dict, sym: str, exit_px: float, exit_ts, exit_reason: str = "SELL") -> dict | None:
     """
-    Record a completed BUY->SELL (or TIMEOUT) trade in state["_trades"].
+    Record a completed BUY->SELL (or TIMEOUT) trade in state[SK+"trades"].
 
     Metrics recorded per trade:
       pnl_pct      — raw return %
@@ -397,11 +412,11 @@ def close_trade(state: dict, sym: str, exit_px: float, exit_ts, exit_reason: str
         "win":         pnl_pct > 0,
     }
 
-    if "_trades" not in state:
-        state["_trades"] = []
-    state["_trades"].append(trade)
-    if len(state["_trades"]) > MAX_TRADES_STORED:
-        state["_trades"] = state["_trades"][-MAX_TRADES_STORED:]
+    if SK+"trades" not in state:
+        state[SK+"trades"] = []
+    state[SK+"trades"].append(trade)
+    if len(state[SK+"trades"]) > MAX_TRADES_STORED:
+        state[SK+"trades"] = state[SK+"trades"][-MAX_TRADES_STORED:]
 
     state.pop(sym, None)
     return trade
@@ -568,7 +583,39 @@ def get_bars_finnhub(symbol: str, lookback_bars: int = LOOKBACK,
         return df
     return None
 
-def get_bars_alpaca(chunk: list[str]) -> pd.DataFrame | None:
+def get_bars_alpaca_crypto(chunk: list[str]) -> pd.DataFrame | None:
+    """
+    Multi-symbol OHLCV via Alpaca crypto feed.
+    Symbols must be in 'BTC/USD' format (as stored in cryptolisted.csv).
+    Uses CryptoHistoricalDataClient — separate from the equity client.
+    Feed is 'us' (Alpaca's consolidated crypto feed, free tier).
+    """
+    try:
+        from alpaca.data.historical import CryptoHistoricalDataClient
+        from alpaca.data.requests  import CryptoBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    except Exception as e:
+        print(f"[alpaca-crypto] missing alpaca-py: {e}"); return None
+
+    # Crypto client does not require API keys for market data on free tier,
+    # but passing them is fine and may unlock higher rate limits.
+    client = CryptoHistoricalDataClient(
+        api_key=ALPACA_API_KEY or None,
+        secret_key=ALPACA_SECRET_KEY or None,
+    )
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=LOOKBACK * TIMEFRAME_MINUTES)
+
+    req = CryptoBarsRequest(
+        symbol_or_symbols=chunk,
+        timeframe=TimeFrame(TIMEFRAME_MINUTES, TimeFrameUnit.Minute),
+        start=start, end=end, limit=LOOKBACK,
+    )
+    try:
+        df = client.get_crypto_bars(req).df
+        return normalize_to_multi(df)
+    except Exception as e:
+        print(f"[alpaca-crypto] fetch error: {e}"); return None
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests  import StockBarsRequest
@@ -609,8 +656,9 @@ def scan_once(tickers: list[str]) -> tuple[list, list, dict]:
     universe = tickers[offset:end_ix] if end_ix <= N else tickers[offset:] + tickers[:(end_ix % N)]
     save_offset(end_ix % N)
 
-    print(f"[scan] provider={DATA_PROVIDER} slice={len(universe)} "
-          f"offset={offset}->{end_ix%N} W={W}")
+    print(f"[scan] provider={DATA_PROVIDER} mode={'crypto' if CRYPTO_MODE else 'equity'} "
+          f"slice={len(universe)} offset={offset}->{end_ix%N} "
+          f"TF={TIMEFRAME_MINUTES}Min W={W}")
 
     fetched_ok = fetched_empty = fetch_errors = 0
     sample_logged = False
@@ -634,14 +682,19 @@ def scan_once(tickers: list[str]) -> tuple[list, list, dict]:
             return all_buys, all_sells, last_prices
         bars = pd.concat(frames).sort_index()
     else:
-        chunks = [universe[i:i+120] for i in range(0, len(universe), 120)]
-        print(f"[scan] alpaca {len(chunks)} chunks parallel")
+        # Choose fetcher based on mode
+        fetcher = get_bars_alpaca_crypto if CRYPTO_MODE else get_bars_alpaca
+        # Crypto: all 20 symbols fit in one chunk; equity: 120 per chunk
+        chunk_size = len(universe) if CRYPTO_MODE else 120
+        chunks = [universe[i:i+chunk_size] for i in range(0, len(universe), chunk_size)]
+        mode_label = "crypto" if CRYPTO_MODE else "equity"
+        print(f"[scan] alpaca-{mode_label} {len(chunks)} chunk(s) parallel")
         bars_list = []
         def fetch_chunk(idx_chunk):
             idx, chunk = idx_chunk
             _alpaca_limiter.wait()
             try:
-                return get_bars_alpaca(chunk)
+                return fetcher(chunk)
             except Exception as e:
                 print(f"[scan] chunk {idx+1} err: {e}"); return None
         with ThreadPoolExecutor(max_workers=20) as ex:
@@ -682,11 +735,14 @@ def scan_once(tickers: list[str]) -> tuple[list, list, dict]:
 
         last_prices[sym] = last_px  # record for timeout closes regardless of filters
 
-        if last_px < MIN_PRICE:
-            skipped_filter += 1; continue
-        vol_ma = last.get("vol_ma20", np.nan)
-        if pd.notna(vol_ma) and float(vol_ma) < MIN_VOL_MA:
-            skipped_filter += 1; continue
+        # Equity-only filters — not applied in crypto mode.
+        # Crypto has different volume units and SHIB trades below $0.01.
+        if not CRYPTO_MODE:
+            if last_px < MIN_PRICE:
+                skipped_filter += 1; continue
+            vol_ma = last.get("vol_ma20", np.nan)
+            if pd.notna(vol_ma) and float(vol_ma) < MIN_VOL_MA:
+                skipped_filter += 1; continue
 
         daily_trend = get_daily_trend(df_sym)
         (b_score, b_reasons), (s_score, s_reasons) = score_row(last, prev, prev2, daily_trend)
@@ -710,7 +766,7 @@ def run_and_notify():
     state   = load_state()
 
     # Load adaptive weights (fall back to W_DEFAULT if not yet adapted)
-    saved_w = state.get("_weights")
+    saved_w = state.get(SK+"weights")
     if saved_w:
         W.update(saved_w)
         print(f"[weights] from state: {W}")
@@ -745,7 +801,7 @@ def run_and_notify():
                       f"in {_fmt_dur(trade['hold_min'])}")
 
     # ---- Cooldown filter ----
-    cooldowns = state.get("_cooldowns", {})
+    cooldowns = state.get(SK+"cooldowns", {})
     def filter_cooldown(events, tag):
         out = []
         for item in events:
@@ -758,7 +814,7 @@ def run_and_notify():
         return out
     buys  = filter_cooldown(buys,  "BUY")
     sells = filter_cooldown(sells, "SELL")
-    state["_cooldowns"] = {k: v for k, v in cooldowns.items() if now - v < COOLDOWN_SEC * 2}
+    state[SK+"cooldowns"] = {k: v for k, v in cooldowns.items() if now - v < COOLDOWN_SEC * 2}
 
     # ---- Close SELL signals ----
     for sym, ts, px, score, reasons, tg in sells:
@@ -785,7 +841,7 @@ def run_and_notify():
                       "buy_score": score, "buy_reasons": reasons}
 
     # ---- Weight adaptation ----
-    all_trades       = state.get("_trades", [])
+    all_trades       = state.get(SK+"trades", [])
     prev_count       = len(all_trades) - len(newly_closed)
     adapted          = False
     adapt_report     = []
@@ -797,7 +853,7 @@ def run_and_notify():
         if new_w != dict(W):
             print(f"[adapt] {adapt_report}")
             W.update(new_w)
-            state["_weights"] = dict(W)
+            state[SK+"weights"] = dict(W)
             adapted = True
 
     save_state(state)
@@ -871,7 +927,8 @@ def _format_sentiment(sent: dict | None, side: str) -> str:
 def _build_discord_messages(sections: list[tuple[str, list[str]]], limit: int = 1800) -> list[str]:
     """Chunk Discord messages on line boundaries — never splits a signal."""
     messages: list[str] = []
-    current = "**Confluence Signals**\n"
+    header_label = "**🪙 Crypto Signals**\n" if CRYPTO_MODE else "**Confluence Signals**\n"
+    current = header_label
     for header, lines in sections:
         block = (header + "\n\n" if header else "") + "\n".join(lines)
         if len(current) + len(block) + 1 <= limit:
@@ -897,8 +954,8 @@ if __name__ == "__main__":
     # without running the full scan.
     if os.getenv("REPORT") == "1":
         state   = load_state()
-        trades  = state.get("_trades", [])
-        weights = state.get("_weights", W_DEFAULT)
+        trades  = state.get(SK+"trades", [])
+        weights = state.get(SK+"weights", W_DEFAULT)
         report  = build_performance_report(trades, weights)
         discord(report)
         print(report)

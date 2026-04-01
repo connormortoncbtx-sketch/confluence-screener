@@ -2,9 +2,14 @@ name: Confluence Screener
 
 on:
   schedule:
-    # Every 20 minutes Mon–Fri (UTC). The job itself decides whether to run.
-    - cron: "*/20 * * * 1-5"
-  workflow_dispatch: {}
+    # Every 5 minutes Mon–Fri (GitHub Actions minimum). Market hours check below.
+    - cron: "*/5 * * * 1-5"
+  workflow_dispatch:
+    inputs:
+      report:
+        description: "Send performance report without scanning (set to '1')"
+        required: false
+        default: ""
 
 concurrency:
   group: confluence-screener
@@ -13,7 +18,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +27,6 @@ jobs:
         shell: bash
         run: |
           echo "Run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
 
       - name: Check if US market is open now (holiday-aware)
         id: market_open
@@ -51,13 +55,13 @@ jobs:
       - name: Export secrets to env
         if: steps.market_open.outputs.open == 'true'
         run: |
-          echo "FINNHUB_API_KEY=${{ secrets.FINNHUB_API_KEY }}" >> $GITHUB_ENV
           echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}" >> $GITHUB_ENV
           echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> $GITHUB_ENV
           echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
-          echo "DATA_PROVIDER=finnhub" >> $GITHUB_ENV
-          echo "SCAN_LIMIT=600" >> $GITHUB_ENV
-          echo "DEBUG=1" >> $GITHUB_ENV
+          echo "DATA_PROVIDER=alpaca" >> $GITHUB_ENV
+          echo "SCAN_LIMIT=9999" >> $GITHUB_ENV
+          echo "DEBUG=0" >> $GITHUB_ENV
+          echo "REPORT=${{ github.event.inputs.report }}" >> $GITHUB_ENV
 
       - name: Restore state cache
         if: steps.market_open.outputs.open == 'true'

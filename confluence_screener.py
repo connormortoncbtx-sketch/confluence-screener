@@ -31,6 +31,14 @@ import pandas as pd
 import numpy as np
 import requests
 
+# Load .env for local runs — no-op in GitHub Actions where secrets are
+# injected directly into the environment.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # --------- ENV / Paths ----------
 DATA_PROVIDER       = os.getenv("DATA_PROVIDER", "alpaca").lower()
 FINNHUB_API_KEY     = os.getenv("FINNHUB_API_KEY")

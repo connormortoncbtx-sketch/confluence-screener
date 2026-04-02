@@ -629,6 +629,9 @@ def get_bars_alpaca_crypto(chunk: list[str]) -> pd.DataFrame | None:
         return normalize_to_multi(df)
     except Exception as e:
         print(f"[alpaca-crypto] fetch error: {e}"); return None
+
+def get_bars_alpaca(chunk: list[str]) -> pd.DataFrame | None:
+    """Multi-symbol OHLCV via Alpaca IEX — ~120 symbols per request."""
     try:
         from alpaca.data.historical import StockHistoricalDataClient
         from alpaca.data.requests  import StockBarsRequest

@@ -1,0 +1,64 @@
+name: Crypto Screener
+
+on:
+  schedule:
+    # Every 15 minutes, every day. Crypto is 24/7 — no market hours gate.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      report:
+        description: "Send crypto performance report without scanning (set to '1')"
+        required: false
+        default: ""
+
+concurrency:
+  group: crypto-screener
+  cancel-in-progress: true
+
+jobs:
+  crypto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kickoff marker
+        run: |
+          echo "Crypto run started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+      - name: Export secrets to env
+        run: |
+          echo "ALPACA_API_KEY=${{ secrets.ALPACA_API_KEY }}" >> $GITHUB_ENV
+          echo "ALPACA_SECRET_KEY=${{ secrets.ALPACA_SECRET_KEY }}" >> $GITHUB_ENV
+          echo "DISCORD_WEBHOOK_URL=${{ secrets.DISCORD_WEBHOOK_URL }}" >> $GITHUB_ENV
+          echo "DATA_PROVIDER=alpaca" >> $GITHUB_ENV
+          echo "SCAN_LIMIT=9999" >> $GITHUB_ENV
+          echo "DEBUG=0" >> $GITHUB_ENV
+          echo "CRYPTO_MODE=1" >> $GITHUB_ENV
+          echo "REPORT=${{ github.event.inputs.report }}" >> $GITHUB_ENV
+
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-v1-${{ runner.os }}
+          restore-keys: state-v1-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        run: python confluence_screener.py
+
+      - name: Save state cache
+        if: github.event.inputs.report == ''
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-v1-${{ runner.os }}-${{ github.run_id }}
